@@ -12,6 +12,7 @@ const {
   createNxbtCommand,
   createRigConfig,
   evaluateSafetyGate,
+  getCompatibleControllerProfileId,
   getTrainingReadiness,
   shouldRollbackModel,
   shouldSwitchToShadowModel
@@ -227,12 +228,15 @@ function renderStepList() {
   stepList.innerHTML = SETUP_STEPS.map((step, index) => {
     const done = state.completedSteps.has(step.id);
     const active = state.activeStepId === step.id;
+    const requiredCheck = step.id === "controller_select" && OUTPUT_BACKEND_PROFILES[state.outputBackend].requiresNxbt
+      ? "NXBT 固定使用 Switch 2 Pro 手把。"
+      : step.requiredCheck;
     return `
       <button class="step-button ${done ? "done" : ""} ${active ? "active" : ""}" type="button" data-step="${step.id}">
         <span class="step-index">${done ? "✓" : index + 1}</span>
         <span>
           <span class="step-name">${step.name}</span>
-          <span class="step-sub">${done ? step.successMessage : step.requiredCheck}</span>
+          <span class="step-sub">${done ? step.successMessage : requiredCheck}</span>
         </span>
       </button>
     `;
@@ -310,10 +314,15 @@ function simpleCheck(title, note, ok, helpField) {
 }
 
 function renderControllerSelect() {
+  const nxbtOnly = OUTPUT_BACKEND_PROFILES[state.outputBackend].requiresNxbt;
+  const availableProfiles = nxbtOnly
+    ? [CONTROLLER_PROFILES.switch2_pro]
+    : Object.values(CONTROLLER_PROFILES);
   return `
-    <p class="step-copy">選擇實際固定在機械治具上的控制器。兩種控制器都支援，但校正檔和馬達位置不同。${helpIcon("controllerProfile", "控制器類型說明")}</p>
+    <p class="step-copy">${nxbtOnly ? "NXBT 模擬的是 Switch Pro Controller，因此控制器已固定為 Switch 2 Pro 手把。" : "選擇實際固定在機械治具上的控制器。兩種控制器都支援，但校正檔和馬達位置不同。"}${helpIcon("controllerProfile", "控制器類型說明")}</p>
+    ${nxbtOnly ? `<div class="alert"><strong>NXBT 限制：</strong>Joy-Con 2 握把不適用於 NXBT 或混合輸出。要使用 Joy-Con 2，請先把控制輸出改回「機械治具」。</div>` : ""}
     <div class="choice-grid">
-      ${Object.values(CONTROLLER_PROFILES).map((profile) => `
+      ${availableProfiles.map((profile) => `
         <div class="choice-card ${state.selectedProfileId === profile.id ? "selected" : ""}">
           <button type="button" data-profile="${profile.id}">
             <strong>${profile.beginnerName}</strong>
@@ -357,9 +366,8 @@ function renderCameraCalibration() {
 function renderRigCalibration() {
   const calibratedCount = state.calibratedSlotIds.size;
   const total = state.rigConfig.slots.length;
-  return `
-    <p class="step-copy">完整手把校正會逐一測試雙搖桿、方向鍵、正面按鍵、肩鍵/扳機與特殊鍵。按不到時，訊息會直接告訴你要調哪個模組。</p>
-    <div class="alert">${calibratedCount === total ? "完整手把校正完成。" : `還有 ${total - calibratedCount} 個輸入沒有校正。範例修正：手把右肩鍵沒有壓到，請把上方模組往下調 2-3 mm。`}</div>
+  const backend = OUTPUT_BACKEND_PROFILES[state.outputBackend];
+  const mechanicalCalibration = backend.requiresRigCalibration ? `
     <div class="controller-slots">
       ${state.rigConfig.slots.map((slot) => `
         <div class="slot-row">
@@ -367,7 +375,15 @@ function renderRigCalibration() {
           <button class="secondary-button" data-calibrate="${slot.id}" type="button" ${state.connectionOk ? "" : "disabled"}>${state.calibratedSlotIds.has(slot.id) ? "已完成" : "等待硬體回報"}</button>
         </div>
       `).join("")}
-    </div>
+    </div>` : "";
+  const nxbtCalibration = backend.requiresNxbt ? `
+    <div class="alert"><strong>NXBT 輸入測試：</strong>請先連線 NXBT，再依 Switch 2 官方的按鍵測試與搖桿校正畫面逐步驗證。這只驗證模擬手把輸入，不會取代鏡頭、急停或模型檢查。</div>
+    <div class="step-actions"><button class="secondary-button" data-action="open-nxbt-test" type="button">測試 NXBT 按鍵與搖桿</button></div>` : "";
+  return `
+    <p class="step-copy">${backend.requiresRigCalibration ? "完整手把校正會逐一測試雙搖桿、搖桿按下、方向鍵、正面按鍵、肩鍵/扳機與特殊鍵。按不到時，訊息會直接告訴你要調哪個模組。" : "NXBT 不使用機械治具行程校正，但仍應在 Switch 2 官方測試畫面逐一確認按鍵與雙搖桿。"}</p>
+    ${backend.requiresRigCalibration ? `<div class="alert">${calibratedCount === total ? "完整手把校正完成。" : `還有 ${total - calibratedCount} 個輸入沒有校正。範例修正：手把右肩鍵沒有壓到，請把上方模組往下調 2-3 mm。`}</div>` : ""}
+    ${mechanicalCalibration}
+    ${nxbtCalibration}
     <div class="step-actions">
       <button class="primary-button" data-action="complete-step" type="button">校正完成，下一步</button>
     </div>
@@ -478,8 +494,17 @@ function bindStepEvents(stepId) {
   });
 
   stepContent.querySelectorAll("[data-profile]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.selectedProfileId = button.dataset.profile;
+    button.addEventListener("click", async () => {
+      const previousProfileId = state.selectedProfileId;
+      const requestedProfileId = getCompatibleControllerProfileId(button.dataset.profile, state.outputBackend);
+      try {
+        const saved = await window.ProjectUI?.saveControllerOutputSelection(requestedProfileId, state.outputBackend);
+        state.selectedProfileId = saved?.profileId || requestedProfileId;
+      } catch (error) {
+        state.selectedProfileId = previousProfileId;
+        showToast(`控制器設定未保存：${error.message}`);
+        return;
+      }
       state.rigConfig = createConfiguredRigConfig(state.selectedProfileId);
       state.calibratedSlotIds.clear();
       showToast(`${CONTROLLER_PROFILES[state.selectedProfileId].beginnerName} profile 已載入。`);
@@ -490,13 +515,35 @@ function bindStepEvents(stepId) {
 
   stepContent.querySelectorAll("[data-backend]").forEach((button) => {
     button.addEventListener("click", async () => {
+      const previousBackend = state.outputBackend;
+      const previousProfileId = state.selectedProfileId;
       if (state.engineMode !== "idle") await window.ProjectUI?.sendControl("stop");
       await closeSerialPort();
       await window.ProjectUI?.disconnectNxbt();
-      state.outputBackend = button.dataset.backend;
+      const requestedBackend = button.dataset.backend;
+      const compatibleProfileId = getCompatibleControllerProfileId(state.selectedProfileId, requestedBackend);
+      const profileChanged = compatibleProfileId !== state.selectedProfileId;
+      try {
+        const saved = await window.ProjectUI?.saveControllerOutputSelection(compatibleProfileId, requestedBackend);
+        state.outputBackend = saved?.backend || requestedBackend;
+        state.selectedProfileId = saved?.profileId || compatibleProfileId;
+      } catch (error) {
+        state.outputBackend = previousBackend;
+        state.selectedProfileId = previousProfileId;
+        showToast(`輸出方式未保存：${error.message}`);
+        renderActiveStep();
+        updateStatus();
+        return;
+      }
+      state.rigConfig = createConfiguredRigConfig(state.selectedProfileId);
+      state.calibratedSlotIds.clear();
+      state.completedSteps.delete("rig_calibration");
       state.nxbtReady = false;
       state.emergencyStopOk = false;
-      showToast(`已切換輸出方式：${OUTPUT_BACKEND_PROFILES[state.outputBackend].beginnerName}`);
+      showToast(profileChanged
+        ? `已切換輸出方式並將控制器改為 ${CONTROLLER_PROFILES[state.selectedProfileId].beginnerName}。`
+        : `已切換輸出方式：${OUTPUT_BACKEND_PROFILES[state.outputBackend].beginnerName}`);
+      renderStepList();
       renderActiveStep();
       updateStatus();
     });
@@ -564,6 +611,10 @@ async function handleAction(action) {
     state.nxbtReady = Boolean(await window.ProjectUI?.connectNxbt());
     renderActiveStep();
     updateStatus();
+  }
+
+  if (action === "open-nxbt-test") {
+    window.ProjectUI?.openNxbtInputTest();
   }
 
   if (action === "camera-tip") {
@@ -1259,8 +1310,8 @@ async function loadPersistentState(projectId, saved = {}) {
   state.activeStepId = SETUP_STEPS[0].id;
   state.completedSteps = new Set((Array.isArray(saved.completedSteps) ? saved.completedSteps : [])
     .filter((stepId) => !runtimeStepIds.has(stepId)));
-  state.selectedProfileId = CONTROLLER_PROFILES[saved.selectedProfileId] ? saved.selectedProfileId : "switch2_pro";
   state.outputBackend = OUTPUT_BACKEND_PROFILES[saved.outputBackend] ? saved.outputBackend : OUTPUT_BACKENDS.MECHANICAL_RIG;
+  state.selectedProfileId = getCompatibleControllerProfileId(saved.selectedProfileId, state.outputBackend);
   state.rigConfig = createConfiguredRigConfig(state.selectedProfileId);
   state.trainingSeconds = Number(saved.trainingSeconds) || 0;
   state.bestScore = Number(saved.bestScore) || 0;
@@ -1310,6 +1361,7 @@ function applyEffectiveSettings(settings = {}, { preserveSelections = false } = 
   state.runtimeSettings = JSON.parse(JSON.stringify(settings));
   if (!preserveSelections && CONTROLLER_PROFILES[settings.controller?.profile]) state.selectedProfileId = settings.controller.profile;
   if (!preserveSelections && OUTPUT_BACKEND_PROFILES[settings.output?.backend]) state.outputBackend = settings.output.backend;
+  state.selectedProfileId = getCompatibleControllerProfileId(state.selectedProfileId, state.outputBackend);
   state.rigConfig = createConfiguredRigConfig(state.selectedProfileId);
   if (previousProfileId !== state.selectedProfileId || previousBackend !== state.outputBackend) state.calibratedSlotIds.clear();
   const live = settings.liveLearning ?? {};
@@ -1352,6 +1404,7 @@ window.AppRuntime = {
   loadPersistentState,
   applyEffectiveSettings,
   closeCamera,
+  closeSerialPort,
   canRouteEngineAction,
   routeRigAction,
   routeRigNeutral,

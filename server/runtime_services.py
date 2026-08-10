@@ -1823,6 +1823,11 @@ class RuntimeServices:
         except ServiceError:
             pass
 
+    def shutdown(self) -> None:
+        self.stop_active_engine()
+        self.worker.shutdown()
+        self.llm_executor.shutdown(wait=False, cancel_futures=True)
+
     def worker_health(self, project_id: str = "") -> dict[str, Any]:
         try:
             result = self.worker.call("health")

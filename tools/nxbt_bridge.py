@@ -32,6 +32,8 @@ BUTTON_MAP = {
     "dpad_right": "DPAD_RIGHT",
     "plus": "PLUS",
     "minus": "MINUS",
+    "left_stick_press": "L_STICK_PRESS",
+    "right_stick_press": "R_STICK_PRESS",
 }
 
 
@@ -109,7 +111,13 @@ class NxbtSession:
     def _build_input_packet(self, action: dict[str, Any]) -> dict[str, Any]:
         packet = self.nx.create_input_packet()
         for key, pressed in action.get("buttons", {}).items():
-            packet[BUTTON_MAP[key]] = bool(pressed)
+            packet_key = BUTTON_MAP[key]
+            if packet_key == "L_STICK_PRESS":
+                packet["L_STICK"]["PRESSED"] = bool(pressed)
+            elif packet_key == "R_STICK_PRESS":
+                packet["R_STICK"]["PRESSED"] = bool(pressed)
+            else:
+                packet[packet_key] = bool(pressed)
 
         sticks = action.get("sticks", {})
         for packet_key, prefix in (("L_STICK", "left_stick"), ("R_STICK", "right_stick")):

@@ -153,6 +153,12 @@
     retentionMode: [["size_limit", "依容量上限清理"]],
     minimumSeverity: [["info", "一般資訊以上"], ["warning", "警告以上"], ["error", "只保存錯誤"]]
   };
+  const nxbtTestButtons = [
+    ["dpad_up", "方向鍵 ↑"], ["dpad_down", "方向鍵 ↓"], ["dpad_left", "方向鍵 ←"], ["dpad_right", "方向鍵 →"],
+    ["a", "A"], ["b", "B"], ["x", "X"], ["y", "Y"],
+    ["l", "L"], ["r", "R"], ["zl", "ZL"], ["zr", "ZR"],
+    ["plus", "+"], ["minus", "-"], ["left_stick_press", "左搖桿按下"], ["right_stick_press", "右搖桿按下"]
+  ];
   const ui = {
     token: "",
     projects: [],
@@ -169,6 +175,9 @@
     visionVideo: null,
     lastOcrAt: 0,
     nxbtPollTimer: null,
+    nxbtTestBusy: false,
+    nxbtTestPrepared: new Set(),
+    shuttingDown: false,
     menuTeaching: null,
     menuTaskRunning: false
   };
@@ -212,6 +221,7 @@
       <button class="ghost-button" id="menuNavigatorButton" type="button">選單導航</button>
       <button class="ghost-button" id="assistantButton" type="button">AI 助手</button>
       <button class="ghost-button" id="chipDetectionButton" type="button">晶片偵測</button>
+      <button class="shutdown-button" id="shutdownApplicationButton" type="button" title="停止訓練、釋放裝置並關閉 localhost 後端">結束程式</button>
       <span class="engine-badge" id="engineAvailability">真實引擎：檢查中</span>
     `;
     topbar.insertBefore(tools, topbar.lastElementChild);
@@ -228,6 +238,7 @@
       <dialog class="app-dialog wide-dialog" id="bindingsDialog"></dialog>
       <dialog class="app-dialog wide-dialog" id="guidanceDialog"></dialog>
       <dialog class="app-dialog wide-dialog" id="menuDialog"></dialog>
+      <dialog class="app-dialog wide-dialog" id="nxbtTestDialog"></dialog>
     `);
     document.querySelector("#projectMenuButton").addEventListener("click", openProjectDialog);
     document.querySelector("#settingsCenterButton").addEventListener("click", openSettings);
@@ -237,6 +248,7 @@
     document.querySelector("#menuNavigatorButton").addEventListener("click", openMenuNavigator);
     document.querySelector("#assistantButton").addEventListener("click", openAssistant);
     document.querySelector("#chipDetectionButton").addEventListener("click", openChipDetection);
+    document.querySelector("#shutdownApplicationButton").addEventListener("click", shutdownApplication);
   }
 
   function dialogHeader(title, subtitle = "") {
@@ -523,7 +535,10 @@
     ]);
     ui.settings = settings;
     ui.presets = presets.presets;
-    renderSettings(settings.effective);
+    const displayedSettings = structuredClone(settings.effective);
+    displayedSettings.output.backend = runtime.state.outputBackend;
+    displayedSettings.controller.profile = runtime.state.selectedProfileId;
+    renderSettings(displayedSettings);
   }
 
   function renderSettings(values, search = "") {
@@ -540,7 +555,7 @@
       </div>
       <label class="danger-unlock"><input id="dangerUnlock" type="checkbox" /> 解鎖危險設定 ${info("危險設定會影響治具動作。推薦維持預設值；選錯可能造成異常按壓，但後端硬性上限仍不會被突破。")}</label>
       <div class="settings-categories">
-        ${Object.entries(values).map(([category, fields]) => categoryEditor(category, fields, search)).join("")}
+        ${Object.entries(values).map(([category, fields]) => categoryEditor(category, fields, search, values)).join("")}
       </div>
       <div class="dialog-footer">
         <button class="ghost-button" id="resetAllSettings" type="button">全部重設</button>
@@ -553,7 +568,7 @@
     if (!dialog.open) dialog.showModal();
   }
 
-  function categoryEditor(category, fields, search) {
+  function categoryEditor(category, fields, search, allValues) {
     const label = categoryLabels[category] || category;
     const items = Object.entries(fields).filter(([key]) => `${label} ${key} ${fieldLabels[key] || ""}`.toLowerCase().includes(search.toLowerCase()));
     if (!items.length) return "";
@@ -561,18 +576,19 @@
       <details class="settings-category" open>
         <summary><strong>${esc(label)}</strong><button class="danger-link" data-reset-category="${esc(category)}" type="button">重設分類</button></summary>
         <div class="settings-grid">
-          ${items.map(([key, value]) => settingControl(category, key, value)).join("")}
+          ${items.map(([key, value]) => settingControl(category, key, value, allValues)).join("")}
         </div>
       </details>
     `;
   }
 
-  function settingControl(category, key, value) {
+  function settingControl(category, key, value, allValues) {
     const locked = dangerousCategories.has(category) ? "data-dangerous disabled" : "";
     const label = fieldLabels[key] || key;
     const help = fieldHelp[key] || `這是「${label}」設定。推薦先使用預設值；不確定時不需要調整。`;
     if (selectOptions[key]) {
-      return `<label class="setting-row"><span>${esc(label)} ${info(help)}</span><select data-setting="${esc(category)}.${esc(key)}" ${locked}>${selectOptions[key].map(([option, text]) => `<option value="${esc(option)}" ${option === value ? "selected" : ""}>${esc(text)}</option>`).join("")}</select></label>`;
+      const nxbtProfileLocked = category === "controller" && key === "profile" && ["nxbt_bluetooth", "hybrid"].includes(allValues.output?.backend);
+      return `<label class="setting-row"><span>${esc(label)} ${info(help)}</span><select data-setting="${esc(category)}.${esc(key)}" ${locked} ${nxbtProfileLocked ? "data-nxbt-profile-lock" : ""}>${selectOptions[key].map(([option, text]) => `<option value="${esc(option)}" ${option === value ? "selected" : ""} ${nxbtProfileLocked && option !== "switch2_pro" ? "disabled" : ""}>${esc(text)}</option>`).join("")}</select>${category === "controller" && key === "profile" ? `<small data-nxbt-profile-note ${nxbtProfileLocked ? "" : "hidden"}>NXBT 只能使用 Switch 2 Pro 手把。</small>` : ""}</label>`;
     }
     if (typeof value === "boolean") {
       return `<label class="setting-row"><span>${esc(label)} ${info(help)}</span><input data-setting="${esc(category)}.${esc(key)}" type="checkbox" ${value ? "checked" : ""} ${locked} /></label>`;
@@ -588,12 +604,27 @@
   }
 
   function bindSettingsEvents(dialog, values) {
+    const syncControllerBackendCompatibility = () => {
+      const backendInput = dialog.querySelector('[data-setting="output.backend"]');
+      const profileInput = dialog.querySelector('[data-setting="controller.profile"]');
+      if (!backendInput || !profileInput) return;
+      const nxbtLocked = ["nxbt_bluetooth", "hybrid"].includes(backendInput.value);
+      if (nxbtLocked) profileInput.value = "switch2_pro";
+      profileInput.querySelector('option[value="joycon2_grip"]')?.toggleAttribute("disabled", nxbtLocked);
+      profileInput.toggleAttribute("data-nxbt-profile-lock", nxbtLocked);
+      const dangerUnlocked = Boolean(dialog.querySelector("#dangerUnlock")?.checked);
+      profileInput.disabled = nxbtLocked || !dangerUnlocked;
+      const note = dialog.querySelector("[data-nxbt-profile-note]");
+      if (note) note.hidden = !nxbtLocked;
+    };
     dialog.querySelector("#settingsSearch").addEventListener("change", (event) => renderSettings(values, event.target.value));
     dialog.querySelector("#dependenciesButton").addEventListener("click", openDependencies);
     dialog.querySelector("#llmSettingsButton").addEventListener("click", openLlmSettings);
     dialog.querySelector("#dangerUnlock").addEventListener("change", (event) => {
       dialog.querySelectorAll("[data-dangerous]").forEach((input) => { input.disabled = !event.target.checked; });
+      syncControllerBackendCompatibility();
     });
+    dialog.querySelector('[data-setting="output.backend"]')?.addEventListener("change", syncControllerBackendCompatibility);
     dialog.querySelector("#saveProjectSettings").addEventListener("click", async () => {
       const next = readSettings(dialog, values);
       ui.settings = await api(`/api/projects/${ui.current.manifest.id}/settings`, { method: "PUT", json: next });
@@ -626,6 +657,7 @@
       runtime.showToast("自訂模板已保存。");
       dialog.close();
     });
+    syncControllerBackendCompatibility();
   }
 
   function readSettings(dialog, base) {
@@ -1671,6 +1703,122 @@
     }
   }
 
+  function openNxbtInputTest() {
+    if (!requireProject()) return;
+    const dialog = document.querySelector("#nxbtTestDialog");
+    const ready = Boolean(runtime.state.nxbtReady);
+    ui.nxbtTestPrepared = new Set();
+    dialog.innerHTML = `
+      ${dialogHeader("NXBT 按鍵與搖桿測試", "先在 Switch 2 開啟官方測試畫面，再從這裡逐一送出短動作。測試不會啟動訓練。")}
+      ${ready ? "" : `<div class="alert warning">NXBT 尚未連線。請先回到設備檢查按「連接 NXBT」。</div>`}
+      <div class="alert warning"><strong>重要：</strong>NXBT 模擬的是 Switch Pro Controller。HOME、截圖、C、GL、GR 不會出現在這個測試面板，也不能由此面板送出。${info("這是什麼：NXBT 測試安全限制。推薦：只在官方測試畫面操作。選錯會怎樣：若在遊戲或選單內測試，按鍵可能觸發非預期操作。")}</div>
+
+      <section class="nxbt-test-section" aria-labelledby="nxbtButtonTestTitle">
+        <h3 id="nxbtButtonTestTitle">1. 測試按鍵</h3>
+        <p class="official-test-path"><strong>Switch 2 請先開啟：</strong>HOME 選單 → 主機設定 → 控制器與周邊設備 → 測試輸入裝置 → 測試控制器按鍵</p>
+        <p>畫面開啟後，按下面任一按鍵。Switch 2 畫面應顯示相同圖示。官方測試畫面不會顯示 HOME、截圖、C、POWER、音量或 SYNC。</p>
+        <label class="check-line"><input id="nxbtButtonScreenConfirmed" type="checkbox" ${ready ? "" : "disabled"}><strong>我已開啟「測試控制器按鍵」畫面</strong><span>勾選後才會啟用測試按鈕。</span></label>
+        <div class="nxbt-input-test-grid">
+          ${nxbtTestButtons.map(([operation, label]) => `<button class="secondary-button" type="button" data-nxbt-test-interface="buttons" data-nxbt-test-operation="${operation}" disabled>${label}</button>`).join("")}
+        </div>
+        <div class="step-actions"><button class="secondary-button" type="button" data-nxbt-test-interface="buttons" data-nxbt-test-operation="finish_button_test" disabled>按住 B，結束官方按鍵測試</button></div>
+      </section>
+
+      <section class="nxbt-test-section" aria-labelledby="nxbtStickTestTitle">
+        <h3 id="nxbtStickTestTitle">2. 測試搖桿</h3>
+        <p class="official-test-path"><strong>Switch 2 請先開啟：</strong>HOME 選單 → 主機設定 → 控制器與周邊設備 → 校正控制搖桿</p>
+        <div class="alert"><strong>順序不能跳過：</strong>先按「選擇左／右搖桿」，NXBT 會把該搖桿向右推到底約 1.2 秒後回中立。Switch 2 選中該搖桿後，才能按四個方向測試。若主機尚未選中，請再按一次選擇按鈕。</div>
+        <label class="check-line"><input id="nxbtStickScreenConfirmed" type="checkbox" ${ready ? "" : "disabled"}><strong>我已開啟「校正控制搖桿」畫面</strong><span>測試只送單一方向，結束後自動回中立。</span></label>
+        <div class="nxbt-stick-test-layout">
+          ${["left", "right"].map((side) => {
+            const sideLabel = side === "left" ? "左搖桿" : "右搖桿";
+            return `<div class="nxbt-stick-test" data-stick-panel="${side}">
+              <strong>${sideLabel}</strong>
+              <button class="primary-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:prepare" disabled>先選擇${sideLabel}（向右到底）</button>
+              <div class="nxbt-stick-directions" aria-label="${sideLabel}方向測試">
+                <button class="secondary-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:up" data-stick-direction="${side}" disabled>↑</button>
+                <button class="secondary-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:left" data-stick-direction="${side}" disabled>←</button>
+                <button class="secondary-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:down" data-stick-direction="${side}" disabled>↓</button>
+                <button class="secondary-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:right" data-stick-direction="${side}" disabled>→</button>
+              </div>
+              <small data-stick-ready="${side}">尚未先推到底</small>
+            </div>`;
+          }).join("")}
+        </div>
+      </section>
+      <p class="nxbt-test-status" id="nxbtTestStatus" role="status">${ready ? "請先開啟對應的 Switch 2 測試畫面。" : "等待 NXBT 連線。"}</p>
+      <div class="dialog-footer"><button class="secondary-button" id="nxbtTestNeutral" type="button" ${ready ? "" : "disabled"}>立即回中立</button></div>
+    `;
+    bindDialogClose(dialog, () => void neutralizeNxbtTest());
+    const refresh = () => refreshNxbtTestControls(dialog, ready);
+    dialog.querySelector("#nxbtButtonScreenConfirmed")?.addEventListener("change", refresh);
+    dialog.querySelector("#nxbtStickScreenConfirmed")?.addEventListener("change", refresh);
+    dialog.querySelectorAll("[data-nxbt-test-operation]").forEach((button) => button.addEventListener("click", () => runNxbtInputTest(dialog, button)));
+    dialog.querySelector("#nxbtTestNeutral")?.addEventListener("click", async () => {
+      await neutralizeNxbtTest();
+      ui.nxbtTestPrepared.clear();
+      dialog.querySelectorAll("[data-stick-ready]").forEach((node) => { node.textContent = "尚未先推到底"; });
+      dialog.querySelector("#nxbtTestStatus").textContent = "已要求 NXBT 回到中立；搖桿方向測試前需重新執行選擇步驟。";
+      refresh();
+    });
+    refresh();
+    if (!dialog.open) dialog.showModal();
+  }
+
+  function refreshNxbtTestControls(dialog, ready) {
+    const buttonConfirmed = Boolean(dialog.querySelector("#nxbtButtonScreenConfirmed")?.checked);
+    const stickConfirmed = Boolean(dialog.querySelector("#nxbtStickScreenConfirmed")?.checked);
+    dialog.querySelectorAll("[data-nxbt-test-interface='buttons']").forEach((button) => {
+      button.disabled = !ready || !buttonConfirmed || ui.nxbtTestBusy;
+    });
+    dialog.querySelectorAll("[data-nxbt-test-interface='sticks']").forEach((button) => {
+      const operation = button.dataset.nxbtTestOperation || "";
+      const side = operation.split(":", 1)[0];
+      const isDirection = Boolean(button.dataset.stickDirection);
+      button.disabled = !ready || !stickConfirmed || ui.nxbtTestBusy || (isDirection && !ui.nxbtTestPrepared.has(side));
+    });
+  }
+
+  async function runNxbtInputTest(dialog, button) {
+    if (ui.nxbtTestBusy || !ui.current?.manifest?.id) return;
+    const interfaceName = button.dataset.nxbtTestInterface;
+    const operation = button.dataset.nxbtTestOperation;
+    const confirmed = interfaceName === "buttons"
+      ? Boolean(dialog.querySelector("#nxbtButtonScreenConfirmed")?.checked)
+      : Boolean(dialog.querySelector("#nxbtStickScreenConfirmed")?.checked);
+    ui.nxbtTestBusy = true;
+    refreshNxbtTestControls(dialog, true);
+    const status = dialog.querySelector("#nxbtTestStatus");
+    status.textContent = operation.endsWith(":prepare") ? "正在把搖桿向右推到底，請不要切換 Switch 2 畫面..." : "正在送出短測試動作...";
+    try {
+      const result = await api(`/api/projects/${encodeURIComponent(ui.current.manifest.id)}/nxbt/test-input`, {
+        method: "POST",
+        json: { interface: interfaceName, operation, screenConfirmed: confirmed }
+      });
+      if (operation.endsWith(":prepare")) {
+        const side = operation.split(":", 1)[0];
+        ui.nxbtTestPrepared.add(side);
+        const readyLabel = dialog.querySelector(`[data-stick-ready='${side}']`);
+        if (readyLabel) readyLabel.textContent = "已先推到底，可以測試四個方向";
+      }
+      status.textContent = result.message;
+    } catch (error) {
+      status.textContent = `測試未送出：${error.message}`;
+    } finally {
+      ui.nxbtTestBusy = false;
+      refreshNxbtTestControls(dialog, Boolean(runtime.state.nxbtReady));
+    }
+  }
+
+  async function neutralizeNxbtTest() {
+    if (!ui.current?.manifest?.id || !runtime.state.nxbtReady) return;
+    try {
+      await api(`/api/projects/${encodeURIComponent(ui.current.manifest.id)}/nxbt/test-input`, { method: "POST", json: { operation: "neutral" } });
+    } catch {
+      // The bridge also returns to neutral after every individual test action.
+    }
+  }
+
   async function logEvent(event, details = {}, severity = "info") {
     if (!ui.current?.manifest?.id || !ui.token) return;
     try {
@@ -1714,6 +1862,59 @@
     }
   }
 
+  async function shutdownApplication() {
+    if (ui.shuttingDown) return;
+    const confirmed = window.confirm("確定要結束程式嗎？訓練與正式遊玩會停止，控制器回到中立，鏡頭、Serial、NXBT 與 localhost 後端都會關閉。");
+    if (!confirmed) return;
+
+    ui.shuttingDown = true;
+    const button = document.querySelector("#shutdownApplicationButton");
+    if (button) {
+      button.disabled = true;
+      button.textContent = "正在結束...";
+    }
+
+    try {
+      stopVisionCapture();
+      if (ui.current?.manifest?.id) {
+        if (runtime.state.engineMode !== "idle") await sendControl("stop");
+        else await neutralizeOutputs();
+        await disconnectNxbt();
+      }
+      runtime.closeCamera({ broadcast: true, silent: true });
+      await runtime.closeSerialPort();
+      await saveState("application_shutdown");
+      const result = await api("/api/shutdown", { method: "POST", json: {} });
+      document.body.innerHTML = `
+        <main class="shutdown-screen">
+          <h1>程式已結束</h1>
+          <p>${esc(result.message || "本機後端已關閉。")}</p>
+          <p>現在可以安全關閉這個瀏覽器分頁。下次請重新執行平台啟動程式。</p>
+        </main>
+      `;
+    } catch (error) {
+      ui.shuttingDown = false;
+      if (button) {
+        button.disabled = false;
+        button.textContent = "結束程式";
+      }
+      runtime.showToast(`程式未能完整結束：${error.message}`);
+    }
+  }
+
+  async function saveControllerOutputSelection(profileId, backend) {
+    if (!ui.current?.manifest?.id) return { profileId, backend };
+    const currentSettings = ui.settings || await api(`/api/projects/${ui.current.manifest.id}/settings`);
+    const next = structuredClone(currentSettings.effective);
+    next.controller.profile = profileId;
+    next.output.backend = backend;
+    ui.settings = await api(`/api/projects/${ui.current.manifest.id}/settings`, { method: "PUT", json: next });
+    return {
+      profileId: ui.settings.effective.controller.profile,
+      backend: ui.settings.effective.output.backend
+    };
+  }
+
   function requireProject() {
     if (ui.current?.manifest?.id) return true;
     openProjectDialog();
@@ -1722,9 +1923,9 @@
   }
 
   window.ProjectUI = {
-    openProjectDialog, openMonitor, sendControl, connectNxbt, disconnectNxbt, testNxbtEmergencyStop, saveState, logEvent,
+    openProjectDialog, openMonitor, openNxbtInputTest, sendControl, connectNxbt, disconnectNxbt, testNxbtEmergencyStop, saveState, logEvent,
     uploadVideo, startEngine, stopEngine, startVisionCapture, stopVisionCapture, refreshWorkerHealth,
-    canaryShadow, rollbackModel, toggleDemonstrationCapture, pretrainDemonstrations
+    canaryShadow, rollbackModel, toggleDemonstrationCapture, pretrainDemonstrations, saveControllerOutputSelection
   };
   bootstrap();
 })();

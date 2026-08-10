@@ -68,6 +68,61 @@ button {
   align-items: center;
 }
 
+.nxbt-test-section {
+  padding: 18px 0;
+  border-top: 1px solid var(--line);
+}
+
+.nxbt-test-section h3 {
+  margin: 0 0 10px;
+}
+
+.official-test-path {
+  padding: 12px;
+  border-left: 4px solid var(--accent);
+  background: var(--surface-strong);
+}
+
+.nxbt-input-test-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.nxbt-stick-test-layout {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 14px;
+}
+
+.nxbt-stick-test {
+  display: grid;
+  gap: 10px;
+  padding: 14px 0;
+  border-top: 1px solid var(--line);
+}
+
+.nxbt-stick-directions {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(44px, 1fr));
+  gap: 8px;
+}
+
+.nxbt-test-status {
+  min-height: 48px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+@media (max-width: 640px) {
+  .nxbt-stick-test-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
 .product-tools {
   margin-left: auto;
 }
@@ -143,6 +198,7 @@ h3 {
 .secondary-button,
 .ghost-button,
 .danger-button,
+.shutdown-button,
 .inline-button {
   min-height: 42px;
   border-radius: 7px;
@@ -183,6 +239,35 @@ h3 {
   gap: 8px;
   color: #fff;
   background: var(--danger);
+}
+
+.shutdown-button {
+  color: #7a2e16;
+  background: #fff7ed;
+  border-color: #d99a72;
+}
+
+.shutdown-button:hover {
+  background: #ffedd5;
+}
+
+.shutdown-screen {
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  min-height: 100vh;
+  padding: 24px;
+  text-align: center;
+  background: var(--page);
+}
+
+.shutdown-screen h1 {
+  margin: 0 0 12px;
+}
+
+.shutdown-screen p {
+  max-width: 52ch;
+  color: var(--muted);
 }
 
 .stop-icon {

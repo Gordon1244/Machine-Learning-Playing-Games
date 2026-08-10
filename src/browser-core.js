@@ -106,6 +106,8 @@
     { id: "left_stick_y", label: "左搖桿 Y", type: INPUT_TYPES.STICK, axis: "y", min: -100, max: 100, neutral: 0 },
     { id: "right_stick_x", label: "右搖桿 X", type: INPUT_TYPES.STICK, axis: "x", min: -100, max: 100, neutral: 0 },
     { id: "right_stick_y", label: "右搖桿 Y", type: INPUT_TYPES.STICK, axis: "y", min: -100, max: 100, neutral: 0 },
+    { id: "left_stick_press", label: "左搖桿按下", type: INPUT_TYPES.BUTTON, maxPressMs: 700 },
+    { id: "right_stick_press", label: "右搖桿按下", type: INPUT_TYPES.BUTTON, maxPressMs: 700 },
     { id: "dpad_up", label: "方向鍵 上", type: INPUT_TYPES.DPAD, maxPressMs: 900 },
     { id: "dpad_down", label: "方向鍵 下", type: INPUT_TYPES.DPAD, maxPressMs: 900 },
     { id: "dpad_left", label: "方向鍵 左", type: INPUT_TYPES.DPAD, maxPressMs: 900 },
@@ -180,6 +182,12 @@
       experimental: true
     }
   };
+
+  function getCompatibleControllerProfileId(profileId, outputBackend) {
+    const backendProfile = OUTPUT_BACKEND_PROFILES[outputBackend];
+    if (backendProfile?.requiresNxbt) return "switch2_pro";
+    return CONTROLLER_PROFILES[profileId] ? profileId : "switch2_pro";
+  }
 
   const SETUP_STEPS = [
     { id: "device_check", name: "設備檢查", requiredCheck: "攝影機、開發板、急停都要連線。", skippableWhen: "不可跳過。", successMessage: "設備已準備好。", failureFix: "請檢查 USB 線、外部電源與急停開關。" },
@@ -265,6 +273,9 @@
       ? rigConfig.slots.filter((slot) => !calibratedSlotIds.includes(slot.id)).map((slot) => slot.label)
       : [];
     const issues = [];
+    if (backendProfile.requiresNxbt && rigConfig.controllerType !== "switch2_pro") {
+      issues.push("NXBT 只能模擬 Switch Pro Controller，請將控制器改為 Switch 2 Pro 手把。");
+    }
     if (!cameraReady) issues.push("尚未取得真實鏡頭畫面，不能正式遊玩。");
     if (!cameraCalibrated) issues.push("鏡頭畫面尚未完成確認，不能正式遊玩。");
     if (!emergencyStopOk) issues.push("急停路徑沒有通過測試，不能正式遊玩。");
@@ -376,6 +387,7 @@
     createRigConfig,
     createNxbtCommand,
     evaluateSafetyGate,
+    getCompatibleControllerProfileId,
     getTrainingReadiness,
     shouldRollbackModel,
     shouldSwitchToShadowModel

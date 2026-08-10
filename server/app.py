@@ -76,6 +76,17 @@ RUNTIME_KEYS = {
     "trainingEngineReady",
     "liveEngineReady",
 }
+NXBT_TEST_BUTTONS = {
+    "a", "b", "x", "y", "l", "r", "zl", "zr",
+    "dpad_up", "dpad_down", "dpad_left", "dpad_right",
+    "plus", "minus", "left_stick_press", "right_stick_press",
+}
+NXBT_TEST_STICK_DIRECTIONS = {
+    "left": (-100, 0),
+    "right": (100, 0),
+    "up": (0, -100),
+    "down": (0, 100),
+}
 
 
 def utc_now() -> str:
@@ -353,6 +364,8 @@ class Store:
         self.lock = threading.RLock()
         self.monitor: dict[str, dict[str, Any]] = {}
         self.nxbt_connectors: dict[str, dict[str, Any]] = {}
+        self.nxbt_test_prepared: dict[str, set[str]] = {}
+        self.shutdown_started = False
         self.ensure_layout()
         self.services = RuntimeServices(ROOT, DATA, PROJECTS, DATA.parent / ".runtime")
 
@@ -518,16 +531,23 @@ class Store:
                 merged[key] = value
         return merged
 
+    def enforce_controller_backend_compatibility(self, settings: dict[str, Any]) -> dict[str, Any]:
+        safe = json.loads(json.dumps(settings))
+        backend = safe.get("output", {}).get("backend")
+        if backend in {"nxbt_bluetooth", "hybrid"}:
+            safe.setdefault("controller", {})["profile"] = "switch2_pro"
+        return safe
+
     def get_global_settings(self) -> dict[str, Any]:
         stored = read_json(GLOBAL_DEFAULTS, DEFAULT_SETTINGS)
         try:
-            return self.normalize_settings(stored, merge_defaults=True)
+            return self.enforce_controller_backend_compatibility(self.normalize_settings(stored, merge_defaults=True))
         except ApiError:
             return json.loads(json.dumps(DEFAULT_SETTINGS))
 
     @synchronized
     def put_global_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
-        safe = self.normalize_settings(payload, merge_defaults=True)
+        safe = self.enforce_controller_backend_compatibility(self.normalize_settings(payload, merge_defaults=True))
         atomic_json(GLOBAL_DEFAULTS, safe)
         return safe
 
@@ -538,16 +558,21 @@ class Store:
             override = self.normalize_settings(override)
         except ApiError:
             override = {}
+        defaults = self.get_global_settings()
+        effective = self.enforce_controller_backend_compatibility(self.deep_merge(defaults, override))
         return {
-            "defaults": self.get_global_settings(),
+            "defaults": defaults,
             "overrides": override,
-            "effective": self.deep_merge(self.get_global_settings(), override),
+            "effective": effective,
         }
 
     @synchronized
     def put_project_settings(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         path = self.require_project(project_id)
         safe = self.normalize_settings(payload)
+        effective = self.enforce_controller_backend_compatibility(self.deep_merge(self.get_global_settings(), safe))
+        if effective["output"]["backend"] in {"nxbt_bluetooth", "hybrid"}:
+            safe.setdefault("controller", {})["profile"] = "switch2_pro"
         atomic_json(path / "settings.json", safe)
         self.log(project_id, "info", "settings", "project_settings_updated", {})
         return self.get_project_settings(project_id)
@@ -957,6 +982,7 @@ class Store:
             )
         with self.lock:
             self.nxbt_connectors[project_id] = connector
+            self.nxbt_test_prepared[project_id] = set()
         runtime = self.runtime_status(project_id)
         runtime["controllerReady"] = ready
         runtime["updatedAt"] = utc_now()
@@ -990,6 +1016,7 @@ class Store:
         except ApiError:
             with self.lock:
                 self.nxbt_connectors.pop(project_id, None)
+                self.nxbt_test_prepared.pop(project_id, None)
             self.runtime_status(project_id)["controllerReady"] = False
             return {"ready": False, "message": "NXBT VM bridge 已失聯，請重新連線。"}
         self.runtime_status(project_id)["controllerReady"] = bool(result.get("controllerReady"))
@@ -1020,17 +1047,26 @@ class Store:
             self.nxbt_request(connector, "/disconnect", {}, timeout=10)
             with self.lock:
                 self.nxbt_connectors.pop(project_id, None)
+                self.nxbt_test_prepared.pop(project_id, None)
         self.runtime_status(project_id)["controllerReady"] = False
         self.log(project_id, "info", "nxbt", "nxbt_disconnected", {})
         return {"ready": False, "message": "NXBT 已斷開。"}
 
-    def normalize_nxbt_action(self, project_id: str, payload: Any, menu_action: bool = False) -> tuple[dict[str, Any], bool]:
+    def normalize_nxbt_action(
+        self,
+        project_id: str,
+        payload: Any,
+        menu_action: bool = False,
+        test_action: bool = False,
+    ) -> tuple[dict[str, Any], bool]:
         if not isinstance(payload, dict):
             raise ApiError(HTTPStatus.BAD_REQUEST, "NXBT action must be an object.")
         allowed_sticks = {"left_stick_x", "left_stick_y", "right_stick_x", "right_stick_y"}
         allowed_buttons = {"a", "b", "x", "y", "l", "r", "zl", "zr"}
         if menu_action:
             allowed_buttons.update({"dpad_up", "dpad_down", "dpad_left", "dpad_right", "plus", "minus"})
+        if test_action:
+            allowed_buttons.update(NXBT_TEST_BUTTONS)
         raw_sticks = payload.get("sticks", {})
         raw_buttons = payload.get("buttons", {})
         if not isinstance(raw_sticks, dict) or not isinstance(raw_buttons, dict):
@@ -1062,6 +1098,85 @@ class Store:
         }
         neutral = not any(sticks.values()) and not any(buttons.values())
         return normalized, neutral
+
+    def test_nxbt_input(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.require_project(project_id)
+        if not isinstance(payload, dict):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "NXBT 測試要求格式不正確。")
+        operation = str(payload.get("operation", "")).strip().lower()
+        interface = str(payload.get("interface", "")).strip().lower()
+        if operation == "neutral":
+            action = {"durationMs": 20, "sticks": {}, "buttons": {}}
+            label = "回到中立"
+        else:
+            if payload.get("screenConfirmed") is not True:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "請先確認 Switch 2 已開啟對應的官方測試畫面。")
+            if interface not in {"buttons", "sticks"}:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "NXBT 測試介面必須是 buttons 或 sticks。")
+            if interface == "buttons":
+                if operation == "finish_button_test":
+                    action = {"durationMs": 1000, "sticks": {}, "buttons": {"b": True}}
+                    label = "按住 B 結束官方按鍵測試"
+                elif operation not in NXBT_TEST_BUTTONS:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "這個按鍵不在 NXBT 安全測試白名單內。")
+                else:
+                    action = {"durationMs": 120, "sticks": {}, "buttons": {operation: True}}
+                    label = operation
+            else:
+                match = re.fullmatch(r"(left|right):(prepare|left|right|up|down)", operation)
+                if not match:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "搖桿測試動作格式不正確。")
+                side, direction = match.groups()
+                with self.lock:
+                    side_prepared = side in self.nxbt_test_prepared.get(project_id, set())
+                if direction != "prepare" and not side_prepared:
+                    side_label = "左" if side == "left" else "右"
+                    raise ApiError(HTTPStatus.CONFLICT, f"請先把{side_label}搖桿向右推到底，讓 Switch 2 選中要測試的搖桿。")
+                x_value, y_value = (100, 0) if direction == "prepare" else NXBT_TEST_STICK_DIRECTIONS[direction]
+                prefix = f"{side}_stick"
+                action = {
+                    "durationMs": 1200 if direction == "prepare" else 350,
+                    "sticks": {f"{prefix}_x": x_value, f"{prefix}_y": y_value},
+                    "buttons": {},
+                }
+                label = f"{side}:{direction}"
+
+        normalized, neutral = self.normalize_nxbt_action(project_id, action, test_action=True)
+        runtime = self.runtime_status(project_id)
+        effective = self.get_project_settings(project_id)["effective"]
+        backend = effective["output"].get("backend")
+        if not neutral:
+            if backend not in {"nxbt_bluetooth", "hybrid"}:
+                raise ApiError(HTTPStatus.CONFLICT, "目前控制輸出不是 NXBT 或混合模式。")
+            if runtime.get("mode") != "idle" or runtime.get("paused"):
+                raise ApiError(HTTPStatus.CONFLICT, "NXBT 測試只能在訓練與正式遊玩都停止時執行。")
+            if not runtime.get("controllerReady"):
+                raise ApiError(HTTPStatus.CONFLICT, "NXBT 控制器尚未連線，不能測試輸入。")
+        with self.lock:
+            connector = self.nxbt_connectors.get(project_id)
+        if not connector:
+            raise ApiError(HTTPStatus.CONFLICT, "NXBT 尚未連線，不能測試輸入。")
+        result = self.nxbt_request(connector, "/action", normalized, timeout=5)
+        if not result.get("ok"):
+            raise ApiError(HTTPStatus.CONFLICT, "NXBT VM bridge 沒有確認測試動作，請檢查 bridge 與控制器連線。")
+        with self.lock:
+            if operation == "neutral":
+                self.nxbt_test_prepared[project_id] = set()
+            elif interface == "sticks" and operation.endswith(":prepare"):
+                self.nxbt_test_prepared.setdefault(project_id, set()).add(operation.split(":", 1)[0])
+        if effective["logging"].get("actions", True):
+            append_jsonl(
+                self.require_project(project_id) / "logs" / f"actions-{datetime.now().strftime('%Y-%m-%d')}.jsonl",
+                {
+                    "timestamp": utc_now(),
+                    "action": "nxbt_test_input",
+                    "backend": "nxbt_bluetooth",
+                    "result": "sent",
+                    "details": {"interface": interface, "operation": operation, "command": normalized},
+                },
+            )
+        self.prune_log_storage(project_id)
+        return {"ok": bool(result.get("ok")), "operation": operation, "message": f"NXBT 測試已送出：{label}。動作結束後已回到中立。"}
 
     def action_nxbt(self, project_id: str, payload: dict[str, Any], manual_demonstration: bool = False, menu_action: bool = False) -> dict[str, Any]:
         self.require_project(project_id)
@@ -1111,6 +1226,7 @@ class Store:
             raise ApiError(HTTPStatus.CONFLICT, "NXBT VM bridge did not confirm emergency stop.")
         with self.lock:
             self.nxbt_connectors.pop(project_id, None)
+            self.nxbt_test_prepared.pop(project_id, None)
         runtime = self.runtime_status(project_id)
         runtime["controllerReady"] = False
         runtime["emergencyStopVerified"] = True
@@ -1134,6 +1250,7 @@ class Store:
         finally:
             with self.lock:
                 self.nxbt_connectors.pop(project_id, None)
+                self.nxbt_test_prepared.pop(project_id, None)
             if project_id in self.monitor:
                 self.monitor[project_id]["controllerReady"] = False
 
@@ -1142,6 +1259,29 @@ class Store:
             project_ids = list(self.nxbt_connectors)
         for project_id in project_ids:
             self.reset_nxbt_connector(project_id)
+
+    def shutdown_application(self) -> None:
+        with self.lock:
+            if self.shutdown_started:
+                return
+            self.shutdown_started = True
+        last_project_id = str(self.app_settings().get("lastProjectId", ""))
+        if ID_RE.fullmatch(last_project_id) and self.project_path(last_project_id).is_dir():
+            self.log(last_project_id, "info", "system", "application_shutdown", {})
+        self.services.stop_active_engine()
+        self.reset_all_nxbt_connectors()
+        self.services.shutdown()
+        with self.lock:
+            for runtime in self.monitor.values():
+                runtime.update({
+                    "mode": "idle",
+                    "paused": False,
+                    "engineReady": False,
+                    "controllerReady": False,
+                    "visionReady": False,
+                    "message": "本機程式已結束。",
+                    "updatedAt": utc_now(),
+                })
 
     def runtime_status(self, project_id: str) -> dict[str, Any]:
         return self.monitor.setdefault(
@@ -1257,6 +1397,19 @@ class Store:
 
 STORE = Store()
 SESSION_TOKEN = secrets.token_urlsafe(24)
+
+
+def shutdown_http_server(server: ThreadingHTTPServer) -> None:
+    try:
+        STORE.shutdown_application()
+    finally:
+        server.shutdown()
+
+
+class LocalThreadingHTTPServer(ThreadingHTTPServer):
+    # Windows address reuse can leave a second localhost process on the same
+    # port, so ending one server would not necessarily stop the application.
+    allow_reuse_address = False
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -1394,6 +1547,11 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             self.require_mutation_auth()
             parts, _ = self.route()
+            if parts == ["api", "shutdown"]:
+                self.read_json_body()
+                self.send_json({"ok": True, "message": "本機程式正在結束。"})
+                threading.Thread(target=shutdown_http_server, args=(self.server,), daemon=True).start()
+                return
             if parts == ["api", "projects"]:
                 return self.send_json(STORE.create_project(self.read_json_body()), HTTPStatus.CREATED)
             if parts == ["api", "capabilities", "refresh"]:
@@ -1505,6 +1663,8 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json(STORE.action_nxbt(parts[2], self.read_json_body(), manual_demonstration=True))
                 if action == "menu-action":
                     return self.send_json(STORE.action_nxbt(parts[2], self.read_json_body(), menu_action=True))
+                if action == "test-input":
+                    return self.send_json(STORE.test_nxbt_input(parts[2], self.read_json_body()))
                 if action == "emergency-stop":
                     self.read_json_body()
                     return self.send_json(STORE.emergency_stop_nxbt(parts[2]))
@@ -1577,9 +1737,13 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8765, type=int)
     args = parser.parse_args()
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server = LocalThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Switch 2 AI local server ready: http://localhost:{args.port}", flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        STORE.shutdown_application()
+        server.server_close()
 
 
 if __name__ == "__main__":

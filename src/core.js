@@ -105,6 +105,8 @@ const sharedSlots = [
   { id: "left_stick_y", label: "左搖桿 Y", type: INPUT_TYPES.STICK, axis: "y", min: -100, max: 100, neutral: 0 },
   { id: "right_stick_x", label: "右搖桿 X", type: INPUT_TYPES.STICK, axis: "x", min: -100, max: 100, neutral: 0 },
   { id: "right_stick_y", label: "右搖桿 Y", type: INPUT_TYPES.STICK, axis: "y", min: -100, max: 100, neutral: 0 },
+  { id: "left_stick_press", label: "左搖桿按下", type: INPUT_TYPES.BUTTON, maxPressMs: 700 },
+  { id: "right_stick_press", label: "右搖桿按下", type: INPUT_TYPES.BUTTON, maxPressMs: 700 },
   { id: "dpad_up", label: "方向鍵 上", type: INPUT_TYPES.DPAD, maxPressMs: 900 },
   { id: "dpad_down", label: "方向鍵 下", type: INPUT_TYPES.DPAD, maxPressMs: 900 },
   { id: "dpad_left", label: "方向鍵 左", type: INPUT_TYPES.DPAD, maxPressMs: 900 },
@@ -179,6 +181,12 @@ export const OUTPUT_BACKEND_PROFILES = {
     experimental: true
   }
 };
+
+export function getCompatibleControllerProfileId(profileId, outputBackend) {
+  const backendProfile = OUTPUT_BACKEND_PROFILES[outputBackend];
+  if (backendProfile?.requiresNxbt) return "switch2_pro";
+  return CONTROLLER_PROFILES[profileId] ? profileId : "switch2_pro";
+}
 
 export const SETUP_STEPS = [
   {
@@ -326,6 +334,9 @@ export function evaluateSafetyGate({
     : [];
 
   const issues = [];
+  if (backendProfile.requiresNxbt && rigConfig.controllerType !== "switch2_pro") {
+    issues.push("NXBT 只能模擬 Switch Pro Controller，請將控制器改為 Switch 2 Pro 手把。");
+  }
   if (!cameraReady) issues.push("尚未取得真實鏡頭畫面，不能正式遊玩。");
   if (!cameraCalibrated) issues.push("鏡頭畫面尚未完成確認，不能正式遊玩。");
   if (!emergencyStopOk) issues.push("急停路徑沒有通過測試，不能正式遊玩。");

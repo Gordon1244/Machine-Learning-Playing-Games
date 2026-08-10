@@ -86,6 +86,51 @@ class StoreTest(unittest.TestCase):
         actions = list((app.PROJECTS / project_id / "logs").glob("actions-*.jsonl"))
         self.assertEqual(len(actions), 1)
 
+    def test_nxbt_and_hybrid_settings_force_pro_controller(self):
+        project = self.store.create_project({"name": "NXBT controller compatibility"})
+        project_id = project["manifest"]["id"]
+
+        settings = self.store.put_project_settings(project_id, {
+            "controller": {"profile": "joycon2_grip"},
+            "output": {"backend": "nxbt_bluetooth"},
+        })
+        self.assertEqual(settings["overrides"]["controller"]["profile"], "switch2_pro")
+        self.assertEqual(settings["effective"]["controller"]["profile"], "switch2_pro")
+
+        app.atomic_json(app.PROJECTS / project_id / "settings.json", {
+            "controller": {"profile": "joycon2_grip"},
+            "output": {"backend": "hybrid"},
+        })
+        restored = self.store.get_project_settings(project_id)
+        self.assertEqual(restored["overrides"]["controller"]["profile"], "joycon2_grip")
+        self.assertEqual(restored["effective"]["controller"]["profile"], "switch2_pro")
+
+        mechanical = self.store.put_project_settings(project_id, {
+            "controller": {"profile": "joycon2_grip"},
+            "output": {"backend": "mechanical_rig"},
+        })
+        self.assertEqual(mechanical["effective"]["controller"]["profile"], "joycon2_grip")
+
+    def test_application_shutdown_stops_engine_connectors_and_worker(self):
+        project = self.store.create_project({"name": "Shutdown"})
+        project_id = project["manifest"]["id"]
+        self.store.nxbt_connectors[project_id] = {"host": "127.0.0.1", "port": 8766, "token": "private"}
+        self.store.runtime_status(project_id).update({"mode": "training", "controllerReady": True, "visionReady": True})
+        calls = []
+        self.store.nxbt_request = lambda connector, path, payload=None, timeout=5: calls.append(path) or {"emergencyStopVerified": True}
+        self.store.services.stop_active_engine = lambda: calls.append("stop_engine")
+        self.store.services.shutdown = lambda: calls.append("shutdown_services")
+
+        self.store.shutdown_application()
+        self.store.shutdown_application()
+
+        self.assertIn("stop_engine", calls)
+        self.assertIn("/emergency-stop", calls)
+        self.assertEqual(calls.count("shutdown_services"), 1)
+        self.assertNotIn(project_id, self.store.nxbt_connectors)
+        self.assertEqual(self.store.runtime_status(project_id)["mode"], "idle")
+        self.assertFalse(self.store.runtime_status(project_id)["controllerReady"])
+
     def test_engine_start_requires_vision_and_nxbt_runtime_verification(self):
         project = self.store.create_project({"name": "Engine gate"})
         project_id = project["manifest"]["id"]
@@ -218,6 +263,50 @@ class StoreTest(unittest.TestCase):
         self.store.action_nxbt(project_id, {"sticks": {}, "buttons": {}})
         self.assertEqual(sent[-1][0], "/action")
 
+    def test_nxbt_input_test_requires_official_screen_and_stick_preparation(self):
+        project = self.store.create_project({"name": "NXBT input test"})
+        project_id = project["manifest"]["id"]
+        self.store.put_project_settings(project_id, {"output": {"backend": "nxbt_bluetooth"}})
+        self.store.nxbt_connectors[project_id] = {"host": "127.0.0.1", "port": 8766, "token": "private"}
+        sent = []
+        self.store.nxbt_request = lambda connector, path, payload=None, timeout=5: sent.append((path, payload)) or {"ok": True}
+        runtime = self.store.runtime_status(project_id)
+        runtime["controllerReady"] = True
+
+        with self.assertRaises(app.ApiError):
+            self.store.test_nxbt_input(project_id, {"interface": "buttons", "operation": "a", "screenConfirmed": False})
+        with self.assertRaises(app.ApiError):
+            self.store.test_nxbt_input(project_id, {"interface": "sticks", "operation": "left:up", "screenConfirmed": True})
+
+        self.store.nxbt_request = lambda connector, path, payload=None, timeout=5: {"ok": False}
+        with self.assertRaises(app.ApiError):
+            self.store.test_nxbt_input(project_id, {"interface": "sticks", "operation": "left:prepare", "screenConfirmed": True})
+        self.assertNotIn("left", self.store.nxbt_test_prepared.get(project_id, set()))
+        self.store.nxbt_request = lambda connector, path, payload=None, timeout=5: sent.append((path, payload)) or {"ok": True}
+
+        prepared = self.store.test_nxbt_input(project_id, {"interface": "sticks", "operation": "left:prepare", "screenConfirmed": True})
+        self.assertTrue(prepared["ok"])
+        self.assertEqual(sent[-1][1]["durationMs"], 1200)
+        self.assertEqual(sent[-1][1]["sticks"]["left_stick_x"], 100)
+        self.store.test_nxbt_input(project_id, {"interface": "sticks", "operation": "left:up", "screenConfirmed": True})
+        self.assertEqual(sent[-1][1]["durationMs"], 350)
+        self.assertEqual(sent[-1][1]["sticks"]["left_stick_y"], -100)
+        self.store.test_nxbt_input(project_id, {"interface": "buttons", "operation": "left_stick_press", "screenConfirmed": True})
+        self.assertTrue(sent[-1][1]["buttons"]["left_stick_press"])
+        self.store.test_nxbt_input(project_id, {"interface": "buttons", "operation": "finish_button_test", "screenConfirmed": True})
+        self.assertEqual(sent[-1][1]["durationMs"], 1000)
+        self.assertTrue(sent[-1][1]["buttons"]["b"])
+
+        with self.assertRaises(app.ApiError):
+            self.store.test_nxbt_input(project_id, {"interface": "buttons", "operation": "home", "screenConfirmed": True})
+        runtime["mode"] = "training"
+        with self.assertRaises(app.ApiError):
+            self.store.test_nxbt_input(project_id, {"interface": "buttons", "operation": "a", "screenConfirmed": True})
+        runtime["mode"] = "idle"
+        self.store.test_nxbt_input(project_id, {"operation": "neutral"})
+        with self.assertRaises(app.ApiError):
+            self.store.test_nxbt_input(project_id, {"interface": "sticks", "operation": "left:down", "screenConfirmed": True})
+
     def test_apply_engine_status_tracks_mode_round_gate_and_shadow(self):
         project = self.store.create_project({"name": "Runtime status"})
         project_id = project["manifest"]["id"]
@@ -325,6 +414,9 @@ class StoreTest(unittest.TestCase):
 
 
 class ApiTest(StoreTest):
+    def test_local_server_disallows_duplicate_port_binding(self):
+        self.assertFalse(app.LocalThreadingHTTPServer.allow_reuse_address)
+
     def setUp(self):
         super().setUp()
         self.server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
@@ -348,6 +440,39 @@ class ApiTest(StoreTest):
         request = urllib.request.Request(self.base + path, data=body, headers=headers, method=method)
         with urllib.request.urlopen(request) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
+
+    def test_nxbt_input_test_route_uses_safe_test_contract(self):
+        project = self.store.create_project({"name": "NXBT API input test"})
+        project_id = project["manifest"]["id"]
+        self.store.put_project_settings(project_id, {"output": {"backend": "nxbt_bluetooth"}})
+        self.store.nxbt_connectors[project_id] = {"host": "127.0.0.1", "port": 8766, "token": "private"}
+        sent = []
+        self.store.nxbt_request = lambda connector, path, payload=None, timeout=5: sent.append((path, payload)) or {"ok": True}
+        self.store.runtime_status(project_id)["controllerReady"] = True
+
+        status, result = self.request(
+            "POST",
+            f"/api/projects/{project_id}/nxbt/test-input",
+            {"interface": "buttons", "operation": "a", "screenConfirmed": True},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        self.assertEqual(sent[-1][0], "/action")
+        self.assertTrue(sent[-1][1]["buttons"]["a"])
+
+    def test_shutdown_route_requires_auth_and_stops_http_server(self):
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            self.request("POST", "/api/shutdown", {}, token=False)
+        self.assertEqual(denied.exception.code, 403)
+
+        shutdown_called = threading.Event()
+        app.STORE.shutdown_application = shutdown_called.set
+        status, result = self.request("POST", "/api/shutdown", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        self.assertTrue(shutdown_called.wait(timeout=2))
+        self.thread.join(timeout=2)
+        self.assertFalse(self.thread.is_alive())
 
     def test_api_crud_auth_and_static_data_block(self):
         status, health = self.request("GET", "/api/health")

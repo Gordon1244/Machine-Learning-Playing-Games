@@ -14,6 +14,7 @@ import {
   createNxbtCommand,
   createRigConfig,
   evaluateSafetyGate,
+  getCompatibleControllerProfileId,
   getTrainingReadiness,
   shouldRollbackModel,
   shouldSwitchToShadowModel
@@ -29,6 +30,8 @@ test("both Switch 2 controller profiles expose full controller slots", () => {
     assert(slotIds.includes("left_stick_y"));
     assert(slotIds.includes("right_stick_x"));
     assert(slotIds.includes("right_stick_y"));
+    assert(slotIds.includes("left_stick_press"));
+    assert(slotIds.includes("right_stick_press"));
     assert(slotIds.includes("a"));
     assert(slotIds.includes("zr"));
     assert(slotIds.includes("capture"));
@@ -134,6 +137,25 @@ test("NXBT backend does not require mechanical calibration but requires NXBT rea
   });
 
   assert.equal(ready.ok, true);
+});
+
+test("NXBT and hybrid output allow only the Pro controller profile", () => {
+  assert.equal(getCompatibleControllerProfileId("joycon2_grip", OUTPUT_BACKENDS.NXBT_BLUETOOTH), "switch2_pro");
+  assert.equal(getCompatibleControllerProfileId("joycon2_grip", OUTPUT_BACKENDS.HYBRID), "switch2_pro");
+  assert.equal(getCompatibleControllerProfileId("joycon2_grip", OUTPUT_BACKENDS.MECHANICAL_RIG), "joycon2_grip");
+
+  const incompatible = evaluateSafetyGate({
+    rigConfig: createRigConfig("joycon2_grip"),
+    outputBackend: OUTPUT_BACKENDS.NXBT_BLUETOOTH,
+    cameraReady: true,
+    cameraCalibrated: true,
+    emergencyStopOk: true,
+    connectionOk: false,
+    nxbtReady: true,
+    calibratedSlotIds: []
+  });
+  assert.equal(incompatible.ok, false);
+  assert(incompatible.issues.some((issue) => issue.includes("只能模擬 Switch Pro Controller")));
 });
 
 test("training is blocked before required setup is completed", () => {
@@ -366,6 +388,24 @@ test("platform launchers start localhost and open the browser", () => {
   assert(powershellLauncher.includes("/api/health"));
 });
 
+test("web UI provides an authenticated full application shutdown", () => {
+  const source = fs.readFileSync("src/product-ui.js", "utf8");
+  const appSource = fs.readFileSync("src/app.js", "utf8");
+  const serverSource = fs.readFileSync("server/app.py", "utf8");
+  assert(source.includes('id="shutdownApplicationButton"'));
+  assert(source.includes('api("/api/shutdown"'));
+  assert(source.includes('saveState("application_shutdown")'));
+  assert(source.includes("await neutralizeOutputs()"));
+  assert(source.includes("runtime.closeCamera"));
+  assert(source.includes("runtime.closeSerialPort"));
+  assert(source.includes("程式已結束"));
+  assert(appSource.includes("closeSerialPort,"));
+  assert(serverSource.includes('parts == ["api", "shutdown"]'));
+  assert(serverSource.includes("STORE.shutdown_application()"));
+  assert(serverSource.includes("class LocalThreadingHTTPServer(ThreadingHTTPServer)"));
+  assert(serverSource.includes("allow_reuse_address = False"));
+});
+
 test("product UI includes persistent projects, snapshots, logs, and realtime monitor", () => {
   const source = fs.readFileSync("src/product-ui.js", "utf8");
   const monitorSource = fs.readFileSync("src/monitor.js", "utf8");
@@ -418,4 +458,22 @@ test("optional assistant keeps offline guidance and menu workflows available", (
   assert(serverSource.includes('LOCKED_ASSISTANT_INPUTS = {"home", "capture"}'));
   assert(serverSource.includes("選單畫格已與賽車 PPO 資料隔離"));
   assert(serverSource.includes("連續兩次不確定"));
+});
+
+test("NXBT input test requires official screens and stick preparation", () => {
+  const source = fs.readFileSync("src/product-ui.js", "utf8");
+  const appSource = fs.readFileSync("src/app.js", "utf8");
+  assert(source.includes("/nxbt/test-input"));
+  assert(source.includes("測試輸入裝置 → 測試控制器按鍵"));
+  assert(source.includes("控制器與周邊設備 → 校正控制搖桿"));
+  assert(source.includes("先選擇${sideLabel}（向右到底）"));
+  assert(source.includes("finish_button_test"));
+  assert(source.includes("HOME、截圖、C、GL、GR"));
+  assert(source.includes("syncControllerBackendCompatibility"));
+  assert(source.includes("NXBT 只能使用 Switch 2 Pro 手把"));
+  assert(source.includes("saveControllerOutputSelection"));
+  assert(appSource.includes('data-action="open-nxbt-test"'));
+  assert(appSource.includes("Joy-Con 2 握把不適用於 NXBT 或混合輸出"));
+  assert(appSource.includes("getCompatibleControllerProfileId(saved.selectedProfileId, state.outputBackend)"));
+  assert.equal(appSource.includes('data-action="open-nxbt-test" type="button" disabled'), false);
 });

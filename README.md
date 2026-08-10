@@ -18,6 +18,8 @@ chmod +x start-macos.command start-linux.sh
 
 不要直接用 `file://` 開啟 `index.html`。鏡頭權限取決於瀏覽器安全政策，系統不會在未取得真實鏡頭預覽畫面時假裝校正成功。鏡頭頁也提供「關閉鏡頭」，會停止 camera tracks 並清除校正狀態。
 
+只關閉瀏覽器分頁不會自動停止 localhost 後端。正常結束時，請按網頁上方的 `結束程式`，確認後系統會停止訓練與控制、回到中立、釋放鏡頭與 Serial、斷開 NXBT，最後關閉 localhost 伺服器。看到「程式已結束」後即可關閉分頁。
+
 啟動器會執行 `server/app.py`。專案資料會保存在 `data/`，包含遊戲專案、設定、訓練狀態、快照、日志、重要片段資料夾與回收區。切換或重開專案後，鏡頭、Serial、急停與 NXBT 都必須重新驗證。
 
 若要跑核心邏輯測試：
@@ -301,9 +303,19 @@ sudo kill 顯示的_python3_PID
 
 按下 `連接 NXBT` 後，網頁會先顯示「正在等待 Switch 配對」，並每秒檢查一次 bridge 狀態。保持 Switch 控制器配對畫面開啟即可，不需要反覆按連線。只有 bridge 回報控制器已準備完成後，網頁才會顯示 NXBT 已連線。
 
+### 在 Switch 2 測試 NXBT 按鍵與搖桿
+
+NXBT 只模擬 Switch Pro Controller，因此選擇 NXBT 或混合輸出時，程式會自動鎖定為 `Switch 2 Pro 手把`，不提供 Joy-Con 2 握把選項。要使用 Joy-Con 2 握把，必須改用純機械治具輸出。
+
+NXBT 連線完成後，到網頁的「完整手把校正」按 `測試 NXBT 按鍵與搖桿`。這個面板只在訓練與正式遊玩都停止時允許送出測試動作，每個動作結束後都會回中立。
+
+按鍵測試前，先在 Switch 2 開啟：`HOME 選單 → 主機設定 → 控制器與周邊設備 → 測試輸入裝置 → 測試控制器按鍵`。勾選網頁確認框後，再逐一測試方向鍵、A/B/X/Y、L/R/ZL/ZR、`+`、`-` 與左右搖桿按下。Nintendo 官方說明指出 HOME、截圖、C、POWER、音量與 SYNC 不會出現在這個測試；本程式也不允許從測試面板送出 HOME、截圖、C、GL 或 GR。結束官方按鍵測試時，可使用面板的 `按住 B，結束官方按鍵測試`。[Nintendo Switch 2 按鍵測試說明](https://en-americas-support.nintendo.com/app/answers/detail/a_id/68213)
+
+搖桿測試前，先在 Switch 2 開啟：`HOME 選單 → 主機設定 → 控制器與周邊設備 → 校正控制搖桿`。依 Nintendo 官方流程，必須先把要測試的搖桿向任一方向推到底並保持幾秒，主機才會選中該搖桿。因此網頁會強制先按 `先選擇左搖桿` 或 `先選擇右搖桿`，將該搖桿向右推到底約 1.2 秒；完成後才會開放上下左右測試。若 Switch 2 尚未選中搖桿，再按一次選擇按鈕，然後依主機畫面提示檢查。[Nintendo Switch 2 搖桿校正說明](https://en-americas-support.nintendo.com/app/answers/detail/a_id/68192/)
+
 token 只保留在 localhost 後端記憶體，不會寫入專案、快照、匯出檔或日志。只在可信任的私人網路開放 bridge，並確認 VM 防火牆允許 TCP `8766`。
 
-HTTP VM bridge 提供 `/health`、`/connect`、`/disconnect`、`/emergency-stop` 與 `/action`。所有路徑都需要 Bearer token。本機網頁後端只接受 `localhost` 或私人 IPv4，避免把 token 送到公開位址。
+HTTP VM bridge 提供 `/health`、`/connect`、`/disconnect`、`/emergency-stop` 與 `/action`；localhost 後端另以 `/nxbt/test-input` 執行白名單測試。所有 bridge 路徑都需要 Bearer token。本機網頁後端只接受 `localhost` 或私人 IPv4，避免把 token 送到公開位址。
 
 進階診斷時可以在宿主機的 `nxbt` 資料夾執行 `vagrant ssh -c "hostname -I"` 查詢 VM 網路位址。但 VirtualBox 預設顯示的 `10.0.2.15` 通常是 NAT 位址，Windows 與 macOS 一般流程不要將它填入網頁。
 

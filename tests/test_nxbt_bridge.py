@@ -56,8 +56,8 @@ class NxbtBridgeTest(unittest.TestCase):
 
             def create_input_packet(self):
                 packet = {name: False for name in bridge.BUTTON_MAP.values()}
-                packet["L_STICK"] = {"X_VALUE": 0, "Y_VALUE": 0}
-                packet["R_STICK"] = {"X_VALUE": 0, "Y_VALUE": 0}
+                packet["L_STICK"] = {"PRESSED": False, "X_VALUE": 0, "Y_VALUE": 0}
+                packet["R_STICK"] = {"PRESSED": False, "X_VALUE": 0, "Y_VALUE": 0}
                 return packet
 
             def set_controller_input(self, controller_index, packet):
@@ -68,7 +68,7 @@ class NxbtBridgeTest(unittest.TestCase):
         session.apply_action(
             {
                 "durationMs": 20,
-                "buttons": {"a": True, "zr": True},
+                "buttons": {"a": True, "zr": True, "left_stick_press": True},
                 "sticks": {"left_stick_x": 55, "left_stick_y": -35, "right_stick_y": 20},
             }
         )
@@ -78,10 +78,10 @@ class NxbtBridgeTest(unittest.TestCase):
         self.assertEqual(active[0], 7)
         self.assertTrue(active[1]["A"])
         self.assertTrue(active[1]["ZR"])
-        self.assertEqual(active[1]["L_STICK"], {"X_VALUE": 55, "Y_VALUE": 35})
-        self.assertEqual(active[1]["R_STICK"], {"X_VALUE": 0, "Y_VALUE": -20})
+        self.assertEqual(active[1]["L_STICK"], {"PRESSED": True, "X_VALUE": 55, "Y_VALUE": 35})
+        self.assertEqual(active[1]["R_STICK"], {"PRESSED": False, "X_VALUE": 0, "Y_VALUE": -20})
         self.assertFalse(neutral[1]["A"])
-        self.assertEqual(neutral[1]["L_STICK"], {"X_VALUE": 0, "Y_VALUE": 0})
+        self.assertEqual(neutral[1]["L_STICK"], {"PRESSED": False, "X_VALUE": 0, "Y_VALUE": 0})
 
 
 if __name__ == "__main__":

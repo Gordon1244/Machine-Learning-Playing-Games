@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Switch 2 AI 即時監控</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="monitor-page">
+    <main class="monitor-window-shell">
+      <header class="dialog-header">
+        <div>
+          <p class="eyebrow">獨立瀏覽器視窗</p>
+          <h1>即時監控</h1>
+          <p id="monitorProjectName">正在讀取專案...</p>
+        </div>
+      </header>
+      <div class="monitor-toolbar">
+        <button class="secondary-button" data-control="pause" type="button">暫停</button>
+        <button class="secondary-button" data-control="resume" type="button">繼續</button>
+        <button class="secondary-button" data-control="stop" type="button">停止並存檔</button>
+        <button class="danger-button" data-control="emergency-stop" type="button">急停</button>
+        <button class="secondary-button" id="popupSnapshot" type="button">建立快照</button>
+      </div>
+      <div class="monitor-layout">
+        <section class="monitor-video">
+          <video id="popupMonitorVideo" autoplay playsinline muted></video>
+          <div class="camera-empty" id="popupCameraEmpty">鏡頭尚未開啟。請先在主頁取得鏡頭授權。</div>
+          <div class="monitor-roi">ROI</div>
+        </section>
+        <aside class="monitor-details" id="popupMonitorDetails">等待 SSE 狀態...</aside>
+      </div>
+      <div class="toast" id="popupToast" role="status" aria-live="polite"></div>
+    </main>
+    <script src="./src/monitor.js"></script>
+  </body>
+</html>

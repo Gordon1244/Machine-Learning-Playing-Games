@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Switch 2 AI 手把訓練系統</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Nintendo Switch 2 / Mario Kart 類遊戲</p>
+          <h1>AI 實體手把訓練系統</h1>
+        </div>
+        <button class="danger-button" id="emergencyStopButton" type="button">
+          <span aria-hidden="true" class="stop-icon"></span>
+          急停
+        </button>
+      </header>
+
+      <main>
+        <section class="hero-panel" aria-labelledby="home-title">
+          <div class="hero-copy">
+            <h2 id="home-title">不用懂機器學習，也能一步一步讓 AI 學會玩。</h2>
+            <p>先校正攝影機和完整手把治具，再匯入影片或直接實機自學。正式遊玩時，AI 會用畫面表現持續修正。</p>
+            <div class="primary-actions" aria-label="主要入口">
+              <button class="primary-button" data-route="setup" type="button">開始設定</button>
+              <button class="secondary-button" data-route="training" type="button">繼續訓練</button>
+              <button class="secondary-button" data-route="live" type="button">正式遊玩</button>
+            </div>
+          </div>
+          <div class="controller-visual" aria-label="完整控制器治具示意圖">
+            <svg viewBox="0 0 520 300" role="img" aria-labelledby="controller-title controller-desc">
+              <title id="controller-title">完整控制器機械治具</title>
+              <desc id="controller-desc">示意左右搖桿、方向鍵、正面鍵與肩鍵都有獨立致動器。</desc>
+              <path class="pad-body" d="M145 78h230c52 0 95 43 95 95v22c0 41-33 74-74 74-29 0-55-17-67-43H191c-12 26-38 43-67 43-41 0-74-33-74-74v-22c0-52 43-95 95-95Z" />
+              <circle class="stick" cx="175" cy="171" r="35" />
+              <circle class="stick-dot" cx="175" cy="171" r="11" />
+              <circle class="stick" cx="330" cy="194" r="29" />
+              <circle class="stick-dot" cx="330" cy="194" r="9" />
+              <rect class="dpad" x="102" y="123" width="22" height="68" rx="5" />
+              <rect class="dpad" x="79" y="146" width="68" height="22" rx="5" />
+              <circle class="face-button" cx="389" cy="130" r="14" />
+              <circle class="face-button" cx="423" cy="164" r="14" />
+              <circle class="face-button" cx="355" cy="164" r="14" />
+              <circle class="face-button" cx="389" cy="198" r="14" />
+              <path class="shoulder" d="M143 51h95c14 0 25 11 25 25v2H118v-2c0-14 11-25 25-25Z" />
+              <path class="shoulder" d="M282 51h95c14 0 25 11 25 25v2H257v-2c0-14 11-25 25-25Z" />
+              <g class="actuators">
+                <line x1="175" y1="20" x2="175" y2="129" />
+                <line x1="330" y1="28" x2="330" y2="165" />
+                <line x1="389" y1="22" x2="389" y2="116" />
+                <line x1="113" y1="30" x2="113" y2="123" />
+              </g>
+            </svg>
+          </div>
+        </section>
+
+        <section class="workflow" aria-label="引導流程">
+          <aside class="step-list" id="stepList"></aside>
+          <div class="workspace-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">目前步驟</p>
+                <h2 id="activeStepTitle">設備檢查</h2>
+              </div>
+              <button class="ghost-button" id="advancedToggle" type="button">更多選項</button>
+            </div>
+
+            <div class="advanced-box" id="advancedBox" hidden>
+              <label class="check-line">
+                <input type="checkbox" id="fullOnlineAdvanced" />
+                允許全程即時更新
+                <span class="info" data-help="fullOnlineUpdate" tabindex="0" aria-label="全程即時更新說明">i</span>
+              </label>
+              <label>
+                更新間隔秒數
+                <input class="number-input" id="updateInterval" type="number" min="5" max="120" value="20" />
+              </label>
+            </div>
+
+            <div id="stepContent"></div>
+          </div>
+        </section>
+
+        <section class="status-grid" aria-label="系統狀態">
+          <article class="status-tile">
+            <span class="status-label">控制器</span>
+            <strong id="statusController">Switch 2 Pro 手把</strong>
+            <p id="statusControllerNote">完整 profile 已載入</p>
+          </article>
+          <article class="status-tile">
+            <span class="status-label">學習分數 <span class="info" data-help="learningScore" tabindex="0" aria-label="學習分數說明">i</span></span>
+            <strong id="statusScore">尚未訓練</strong>
+            <p id="statusScoreNote">尚未接入訓練引擎</p>
+          </article>
+          <article class="status-tile">
+            <span class="status-label">安全閘門</span>
+            <strong id="statusSafety">待檢查</strong>
+            <p id="statusSafetyNote">校正完成後可進入正式遊玩</p>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script src="./src/browser-core.js"></script>
+    <script src="./src/app.js"></script>
+    <script src="./src/product-ui.js"></script>
+  </body>
+</html>

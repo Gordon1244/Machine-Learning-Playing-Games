@@ -81,6 +81,45 @@ class NxbtBridgeServerTest(unittest.TestCase):
             self.assertTrue(completed["controllerReady"])
             self.assertFalse(completed["connecting"])
 
+    def test_emergency_stop_preempts_in_flight_action(self):
+        started = threading.Event()
+        closed = threading.Event()
+        action_status = []
+
+        class InterruptibleSession:
+            def apply_action(self, action, cancel_event=None):
+                started.set()
+                if cancel_event is not None:
+                    cancel_event.wait(timeout=2)
+                return not bool(cancel_event and cancel_event.is_set())
+
+            def close(self):
+                closed.set()
+
+        state = BridgeState(dry_run=False)
+        state.connected = True
+        state.session = InterruptibleSession()
+        self.server.state = state
+        def send_action():
+            try:
+                self.request("/action", {"buttons": {"a": True}, "durationMs": 1500})
+                action_status.append(200)
+            except urllib.error.HTTPError as error:
+                action_status.append(error.code)
+
+        action_thread = threading.Thread(target=send_action, daemon=True)
+        action_thread.start()
+        self.assertTrue(started.wait(timeout=1))
+        before = time.monotonic()
+        stopped = self.request("/emergency-stop", {})
+        elapsed = time.monotonic() - before
+        action_thread.join(timeout=1)
+        self.assertLess(elapsed, 0.5)
+        self.assertFalse(action_thread.is_alive())
+        self.assertEqual(action_status, [409])
+        self.assertTrue(closed.is_set())
+        self.assertTrue(stopped["emergencyStopVerified"])
+
 
 if __name__ == "__main__":
     unittest.main()

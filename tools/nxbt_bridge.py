@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -88,25 +89,36 @@ class NxbtSession:
     def wait_for_connection(self) -> None:
         self.nx.wait_for_connection(self.controller_index)
 
-    def apply_action(self, action: dict[str, Any]) -> None:
+    def apply_action(self, action: dict[str, Any], cancel_event: threading.Event | None = None) -> bool:
         action = normalize_action(action)
         packet = self._build_input_packet(action)
         duration = action["durationMs"] / 1000
         deadline = time.perf_counter() + duration
+        completed = True
 
         # NXBT's high-level press/tilt helpers block one after another. Direct
         # packets keep acceleration, steering, items and the second stick active
         # at the same time, which is required for real gameplay.
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                completed = False
+                break
             self.nx.set_controller_input(self.controller_index, packet)
             if time.perf_counter() >= deadline:
                 break
-            time.sleep(min(1 / 120, max(0.0, deadline - time.perf_counter())))
+            wait_seconds = min(1 / 120, max(0.0, deadline - time.perf_counter()))
+            if cancel_event is not None:
+                if cancel_event.wait(wait_seconds):
+                    completed = False
+                    break
+            else:
+                time.sleep(wait_seconds)
 
         neutral = self.nx.create_input_packet()
         self.nx.set_controller_input(self.controller_index, neutral)
         time.sleep(1 / 120)
         self.nx.set_controller_input(self.controller_index, neutral)
+        return completed
 
     def _build_input_packet(self, action: dict[str, Any]) -> dict[str, Any]:
         packet = self.nx.create_input_packet()

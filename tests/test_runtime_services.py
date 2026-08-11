@@ -2,8 +2,10 @@ import base64
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -313,6 +315,32 @@ class RuntimeServicesTest(unittest.TestCase):
         result = self.services.worker.call("health")
         self.assertTrue(result["workerReady"])
         self.assertIn("training", result)
+        self.assertIn("訓練", result["training"]["message"])
+        self.assertNotIn("\ufffd", result["training"]["message"])
+
+    def test_worker_timeout_terminates_hung_process_and_allows_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            worker_path = root / "source" / "server" / "worker_main.py"
+            worker_path.parent.mkdir(parents=True)
+            worker_path.write_text(
+                "import json,sys,time\n"
+                "for line in sys.stdin:\n"
+                " payload=json.loads(line)\n"
+                " if payload.get('command') == 'hang': time.sleep(10)\n"
+                " print(json.dumps({'id':payload['id'],'ok':True,'result':{'workerReady':True}}),flush=True)\n",
+                encoding="utf-8",
+            )
+            client = services_module.WorkerClient(root / "runtime", root / "source")
+            client.python = lambda: sys.executable
+            started = time.monotonic()
+            with self.assertRaises(services_module.ServiceError) as caught:
+                client.call("hang", timeout_seconds=0.1)
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertIn("沒有回應", caught.exception.message)
+            self.assertIsNone(client.process)
+            self.assertTrue(client.call("health", timeout_seconds=2)["workerReady"])
+            client.shutdown()
 
     @unittest.skipUnless(os.name == "nt", "Windows DPAPI only")
     def test_windows_remembered_key_uses_dpapi_ciphertext(self):

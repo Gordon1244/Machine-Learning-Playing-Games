@@ -7,6 +7,7 @@ import atexit
 import importlib.util
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -74,6 +75,20 @@ PACKAGES = {
     "pyserial": {"pip": "pyserial", "module": "serial", "label": "pyserial", "recommended": True},
     "keyring": {"pip": "keyring", "module": "keyring", "label": "安全金鑰保存", "recommended": True},
     "openvino": {"pip": "openvino", "module": "openvino", "label": "Intel OpenVINO 加速", "recommended": False},
+}
+
+WORKER_TIMEOUT_SECONDS = {
+    "health": 30,
+    "ocr": 120,
+    "engine_start": 120,
+    "engine_live": 120,
+    "engine_frame": 30,
+    "demonstration_train": 3600,
+    "engine_stop": 30,
+    "next_round": 30,
+    "video_warmup": 3600,
+    "canary": 120,
+    "rollback": 120,
 }
 
 LLM_DEFAULTS = {
@@ -211,6 +226,9 @@ class WorkerClient:
         self.release_process()
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         self.stderr_handle = (self.runtime_root / "worker-stderr.log").open("a", encoding="utf-8")
+        worker_environment = os.environ.copy()
+        worker_environment["PYTHONIOENCODING"] = "utf-8"
+        worker_environment["PYTHONUTF8"] = "1"
         self.process = subprocess.Popen(
             [self.python(), str(self.source_root / "server" / "worker_main.py")],
             stdin=subprocess.PIPE,
@@ -220,6 +238,7 @@ class WorkerClient:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            env=worker_environment,
         )
 
     def release_process(self) -> None:
@@ -252,20 +271,48 @@ class WorkerClient:
 
     def shutdown(self) -> None:
         with self.lock:
-            if self.process:
-                if self.process.poll() is None:
-                    self.process.terminate()
-                    try:
-                        self.process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        self.process.kill()
-                        try:
-                            self.process.wait(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            pass
+            self.terminate_process()
             self.release_process()
 
-    def call(self, command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def terminate_process(self) -> None:
+        if not self.process or self.process.poll() is not None:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def read_response(self, timeout_seconds: float) -> str:
+        assert self.process and self.process.stdout
+        responses: queue.Queue[tuple[str, BaseException | None]] = queue.Queue(maxsize=1)
+
+        def read_line() -> None:
+            try:
+                responses.put((self.process.stdout.readline(), None))
+            except BaseException as read_error:
+                responses.put(("", read_error))
+
+        threading.Thread(target=read_line, daemon=True, name="local-engine-response").start()
+        try:
+            line, read_error = responses.get(timeout=timeout_seconds)
+        except queue.Empty as timeout_error:
+            self.terminate_process()
+            raise TimeoutError(f"worker command {timeout_seconds:g} 秒內沒有回應") from timeout_error
+        if read_error is not None:
+            raise RuntimeError(f"worker output failed: {read_error}") from read_error
+        return line
+
+    def call(
+        self,
+        command: str,
+        payload: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         with self.lock:
             try:
                 self.ensure()
@@ -273,10 +320,15 @@ class WorkerClient:
                 request_id = uuid.uuid4().hex
                 self.process.stdin.write(json.dumps({"id": request_id, "command": command, **(payload or {})}, ensure_ascii=False) + "\n")
                 self.process.stdin.flush()
-                line = self.process.stdout.readline()
+                timeout = float(timeout_seconds if timeout_seconds is not None else WORKER_TIMEOUT_SECONDS.get(command, 120))
+                if timeout <= 0:
+                    raise ValueError("worker timeout must be greater than zero")
+                line = self.read_response(timeout)
                 if not line:
                     raise RuntimeError("worker closed its output stream")
                 response = json.loads(line)
+                if response.get("id") != request_id:
+                    raise RuntimeError("worker returned a mismatched response id")
                 if not response.get("ok"):
                     raise RuntimeError(str(response.get("error", "worker request failed")))
                 return dict(response.get("result") or {})

@@ -36,6 +36,8 @@ class BridgeState:
         self.session: NxbtSession | None = None
         self.pending_session: NxbtSession | None = None
         self.lock = threading.RLock()
+        self.action_lock = threading.Lock()
+        self.action_cancel = threading.Event()
 
     def status(self) -> dict[str, Any]:
         with self.lock:
@@ -60,6 +62,7 @@ class BridgeState:
                     "message": "NXBT is still waiting for the Switch pairing screen.",
                 }
             if self.dry_run:
+                self.action_cancel = threading.Event()
                 self.connected = True
                 return {
                     **self.status(),
@@ -67,6 +70,7 @@ class BridgeState:
                 }
             self.connection_generation += 1
             generation = self.connection_generation
+            self.action_cancel = threading.Event()
             self.connecting = True
             self.connection_error = ""
             threading.Thread(
@@ -122,6 +126,7 @@ class BridgeState:
     def disconnect(self, emergency: bool = False) -> dict[str, Any]:
         with self.lock:
             self.connection_generation += 1
+            self.action_cancel.set()
             sessions = [item for item in (self.session, self.pending_session) if item is not None]
             self.session = None
             self.pending_session = None
@@ -130,14 +135,15 @@ class BridgeState:
             self.connection_error = ""
         close_error = ""
         closed_ids: set[int] = set()
-        for item in sessions:
-            if id(item) in closed_ids:
-                continue
-            closed_ids.add(id(item))
-            try:
-                item.close()
-            except Exception as error:  # NXBT/BlueZ errors must be visible.
-                close_error = str(error)
+        with self.action_lock:
+            for item in sessions:
+                if id(item) in closed_ids:
+                    continue
+                closed_ids.add(id(item))
+                try:
+                    item.close()
+                except Exception as error:  # NXBT/BlueZ errors must be visible.
+                    close_error = str(error)
         if close_error:
             raise BridgeError(
                 HTTPStatus.CONFLICT,
@@ -158,8 +164,15 @@ class BridgeState:
         with self.lock:
             if not self.connected:
                 raise BridgeError(HTTPStatus.CONFLICT, "NXBT controller is not connected.")
-            if self.session is not None:
-                self.session.apply_action(action)
+            session = self.session
+            cancel_event = self.action_cancel
+        if session is not None:
+            with self.action_lock:
+                with self.lock:
+                    if not self.connected or self.session is not session or cancel_event.is_set():
+                        raise BridgeError(HTTPStatus.CONFLICT, "NXBT action was cancelled before execution.")
+                if not session.apply_action(action, cancel_event=cancel_event):
+                    raise BridgeError(HTTPStatus.CONFLICT, "NXBT action was cancelled by emergency stop.")
         return {"ok": True, "action": action if self.dry_run else None}
 
 
@@ -236,6 +249,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class BridgeServer(ThreadingHTTPServer):
+    allow_reuse_address = False
+
     def __init__(self, address: tuple[str, int], token: str, state: BridgeState) -> None:
         super().__init__(address, Handler)
         self.token = token

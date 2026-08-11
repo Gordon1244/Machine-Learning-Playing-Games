@@ -1,6 +1,8 @@
 import importlib.util
 import copy
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -65,13 +67,14 @@ class NxbtBridgeTest(unittest.TestCase):
 
         fake = FakeNx()
         session = bridge.NxbtSession(None, fake, 7)
-        session.apply_action(
+        completed = session.apply_action(
             {
                 "durationMs": 20,
                 "buttons": {"a": True, "zr": True, "left_stick_press": True},
                 "sticks": {"left_stick_x": 55, "left_stick_y": -35, "right_stick_y": 20},
             }
         )
+        self.assertTrue(completed)
 
         active = fake.packets[0]
         neutral = fake.packets[-1]
@@ -82,6 +85,33 @@ class NxbtBridgeTest(unittest.TestCase):
         self.assertEqual(active[1]["R_STICK"], {"PRESSED": False, "X_VALUE": 0, "Y_VALUE": -20})
         self.assertFalse(neutral[1]["A"])
         self.assertEqual(neutral[1]["L_STICK"], {"PRESSED": False, "X_VALUE": 0, "Y_VALUE": 0})
+
+    def test_apply_action_can_be_preempted_and_returns_to_neutral(self):
+        class FakeNx:
+            def __init__(self):
+                self.packets = []
+
+            def create_input_packet(self):
+                packet = {name: False for name in bridge.BUTTON_MAP.values()}
+                packet["L_STICK"] = {"PRESSED": False, "X_VALUE": 0, "Y_VALUE": 0}
+                packet["R_STICK"] = {"PRESSED": False, "X_VALUE": 0, "Y_VALUE": 0}
+                return packet
+
+            def set_controller_input(self, controller_index, packet):
+                self.packets.append((controller_index, copy.deepcopy(packet)))
+
+        fake = FakeNx()
+        session = bridge.NxbtSession(None, fake, 7)
+        cancel = threading.Event()
+        timer = threading.Timer(0.03, cancel.set)
+        timer.start()
+        started = time.monotonic()
+        completed = session.apply_action({"durationMs": 1500, "buttons": {"a": True}, "sticks": {}}, cancel_event=cancel)
+        timer.join(timeout=1)
+        self.assertLess(time.monotonic() - started, 0.3)
+        self.assertFalse(completed)
+        self.assertTrue(fake.packets[0][1]["A"])
+        self.assertFalse(fake.packets[-1][1]["A"])
 
 
 if __name__ == "__main__":

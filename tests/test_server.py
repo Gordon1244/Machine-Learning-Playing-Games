@@ -513,6 +513,16 @@ class ApiTest(StoreTest):
         with self.assertRaises(urllib.error.HTTPError) as bad_limit:
             self.request("GET", f"/api/projects/{project_id}/logs?limit=nope")
         self.assertEqual(bad_limit.exception.code, 400)
+        with self.assertRaises(urllib.error.HTTPError) as invalid_log:
+            self.request(
+                "POST",
+                f"/api/projects/{project_id}/logs",
+                {"severity": "info", "source": "test", "event": "invalid", "details": "not-an-object"},
+            )
+        self.assertEqual(invalid_log.exception.code, 400)
+        status, logs = self.request("GET", f"/api/projects/{project_id}/logs")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(logs["logs"], list)
         status, saved = self.request(
             "PUT",
             f"/api/projects/{project_id}/state",

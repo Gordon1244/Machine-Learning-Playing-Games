@@ -782,11 +782,19 @@ class Store:
     @synchronized
     def log(self, project_id: str, severity: str, source: str, event: str, details: dict[str, Any]) -> dict[str, Any]:
         path = self.require_project(project_id)
+        if severity not in {"info", "warning", "error"}:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Log severity must be info, warning, or error.")
+        if not isinstance(source, str) or not source.strip() or len(source) > 80:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Log source must be a non-empty string up to 80 characters.")
+        if not isinstance(event, str) or not event.strip() or len(event) > 120:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Log event must be a non-empty string up to 120 characters.")
+        if not isinstance(details, dict):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Log details must be an object.")
         entry = {
             "timestamp": utc_now(),
             "severity": severity,
-            "source": source,
-            "event": event,
+            "source": source.strip(),
+            "event": event.strip(),
             "details": details,
         }
         logging = self.get_project_settings(project_id)["effective"]["logging"]
@@ -842,6 +850,11 @@ class Store:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(entry, dict):
+                continue
+            details = entry.get("details")
+            if not isinstance(details, dict):
+                details = {}
             if severity and entry.get("severity") != severity:
                 continue
             if source and entry.get("source") != source:
@@ -850,9 +863,9 @@ class Store:
                 continue
             if time_to and entry.get("timestamp", "") > time_to:
                 continue
-            if round_id and str(entry.get("details", {}).get("roundId", "")) != round_id:
+            if round_id and str(details.get("roundId", "")) != round_id:
                 continue
-            if error_type and error_type not in str(entry.get("details", {}).get("errorType", "")).lower():
+            if error_type and error_type not in str(details.get("errorType", "")).lower():
                 continue
             if text and text not in json.dumps(entry, ensure_ascii=False).lower():
                 continue
@@ -1720,7 +1733,8 @@ class Handler(SimpleHTTPRequestHandler):
         STORE.require_project(project_id)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
         try:
             for _ in range(60):
@@ -1728,7 +1742,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                 self.wfile.flush()
                 time.sleep(1)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             return
 
 

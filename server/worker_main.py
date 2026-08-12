@@ -103,6 +103,171 @@ def parse_ocr(items: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def ordered_screen_corners(points: Any, width: int, height: int) -> Any:
+    import numpy as np
+
+    if not isinstance(points, list) or len(points) != 4:
+        return None
+    parsed = []
+    for point in points:
+        if not isinstance(point, dict):
+            return None
+        try:
+            x = float(point.get("x"))
+            y = float(point.get("y"))
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= x <= 1 or not 0 <= y <= 1:
+            return None
+        parsed.append([x * width, y * height])
+    values = np.asarray(parsed, dtype=np.float32)
+    sums = values.sum(axis=1)
+    differences = np.diff(values, axis=1).reshape(-1)
+    ordered = np.asarray([
+        values[np.argmin(sums)],
+        values[np.argmin(differences)],
+        values[np.argmax(sums)],
+        values[np.argmax(differences)],
+    ], dtype=np.float32)
+    if len({(round(float(x), 2), round(float(y), 2)) for x, y in ordered}) != 4:
+        return None
+    return ordered
+
+
+def normalized_screen_corners(points: Any, width: int, height: int) -> list[dict[str, float]]:
+    return [
+        {"x": round(float(x) / width, 6), "y": round(float(y) / height, 6)}
+        for x, y in points
+    ]
+
+
+def screen_angle_quality(points: Any) -> float:
+    import numpy as np
+
+    qualities = []
+    for index in range(4):
+        previous = points[(index - 1) % 4] - points[index]
+        following = points[(index + 1) % 4] - points[index]
+        denominator = float(np.linalg.norm(previous) * np.linalg.norm(following))
+        cosine = abs(float(np.dot(previous, following)) / denominator) if denominator else 1.0
+        qualities.append(max(0.0, 1.0 - cosine))
+    return sum(qualities) / len(qualities)
+
+
+def detect_screen(
+    image_b64: str,
+    requested_corners: Any = None,
+    requested_source: str = "manual",
+) -> dict[str, Any]:
+    status = modules()
+    if not status["opencv"] or not status["numpy"]:
+        return {
+            "screenDetected": False,
+            "screenConfidence": 0.0,
+            "screenCorners": [],
+            "cornerSource": "none",
+            "processedImageBase64": image_b64,
+            "message": "OpenCV 尚未安裝，無法偵測螢幕四角。",
+        }
+    import cv2
+    import numpy as np
+
+    raw = base64.b64decode(image_b64, validate=True)
+    image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError("無法解碼鏡頭畫格。")
+    height, width = image.shape[:2]
+    points = ordered_screen_corners(requested_corners, width, height)
+    source = "locked_auto" if points is not None and requested_source == "locked_auto" else "manual" if points is not None else "auto"
+    area_ratio = 0.0
+    angle_quality = 0.0
+
+    if points is None:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        median = float(np.median(blurred))
+        lower = int(max(20, 0.55 * median))
+        upper = int(min(255, max(lower + 40, 1.45 * median)))
+        edges = cv2.Canny(blurred, lower, upper)
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=2)
+        contours, _hierarchy = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        best: tuple[float, Any, float, float] | None = None
+        image_area = float(width * height)
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:30]:
+            contour_area = float(cv2.contourArea(contour))
+            ratio = contour_area / image_area
+            if ratio < 0.08 or ratio > 0.98:
+                continue
+            perimeter = cv2.arcLength(contour, True)
+            polygon = cv2.approxPolyDP(contour, 0.025 * perimeter, True)
+            if len(polygon) != 4 or not cv2.isContourConvex(polygon):
+                continue
+            candidate = ordered_screen_corners(
+                [{"x": float(item[0][0]) / width, "y": float(item[0][1]) / height} for item in polygon],
+                width,
+                height,
+            )
+            if candidate is None:
+                continue
+            quality = screen_angle_quality(candidate)
+            score_value = 0.45 + 0.30 * quality + 0.25 * min(1.0, ratio / 0.55)
+            if best is None or score_value > best[0]:
+                best = (score_value, candidate, ratio, quality)
+        if best is not None:
+            _score, points, area_ratio, angle_quality = best
+    else:
+        area_ratio = abs(float(cv2.contourArea(points))) / float(width * height)
+        angle_quality = screen_angle_quality(points)
+
+    convex = bool(points is not None and cv2.isContourConvex(points.reshape((-1, 1, 2)).astype(np.float32)))
+    if points is None or area_ratio < 0.05 or not convex or angle_quality < 0.25:
+        return {
+            "screenDetected": False,
+            "screenConfidence": 0.0,
+            "screenCorners": [],
+            "cornerSource": "none",
+            "processedImageBase64": image_b64,
+            "message": "尚未找到可信任的螢幕四角；四個角不可交叉或過度擠在一起。",
+        }
+
+    top_width = np.linalg.norm(points[1] - points[0])
+    bottom_width = np.linalg.norm(points[2] - points[3])
+    left_height = np.linalg.norm(points[3] - points[0])
+    right_height = np.linalg.norm(points[2] - points[1])
+    target_width = max(64, int(round(max(top_width, bottom_width))))
+    target_height = max(36, int(round(max(left_height, right_height))))
+    scale = min(1.0, 1280 / target_width, 720 / target_height)
+    target_width = max(64, int(round(target_width * scale)))
+    target_height = max(36, int(round(target_height * scale)))
+    destination = np.asarray(
+        [[0, 0], [target_width - 1, 0], [target_width - 1, target_height - 1], [0, target_height - 1]],
+        dtype=np.float32,
+    )
+    transform = cv2.getPerspectiveTransform(points, destination)
+    cropped = cv2.warpPerspective(image, transform, (target_width, target_height))
+    ok, encoded = cv2.imencode(".jpg", cropped, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    processed = base64.b64encode(encoded.tobytes()).decode("ascii") if ok else image_b64
+    confidence = min(0.99, 0.50 + 0.25 * angle_quality + 0.25 * min(1.0, area_ratio / 0.55))
+    if source in {"manual", "locked_auto"}:
+        confidence = max(confidence, 0.96)
+    return {
+        "screenDetected": True,
+        "screenConfidence": round(confidence, 4),
+        "screenCorners": normalized_screen_corners(points, width, height),
+        "cornerSource": source,
+        "processedWidth": target_width,
+        "processedHeight": target_height,
+        "processedImageBase64": processed,
+        "message": (
+            "已偵測螢幕四角。"
+            if source == "auto"
+            else "已鎖定自動偵測的螢幕四角。"
+            if source == "locked_auto"
+            else "已使用手動調整的螢幕四角。"
+        ),
+    }
+
+
 class OcrEngine:
     def __init__(self) -> None:
         self.reader: Any = None
@@ -763,6 +928,12 @@ def handle(payload: dict[str, Any]) -> dict[str, Any]:
         return {"workerReady": True, "ocr": modules()["easyocr"], "training": TRAINING.health()}
     if command == "ocr":
         return OCR.read(str(payload.get("imageBase64", "")), list(payload.get("languages") or []), dict(payload.get("rewardConfig") or {}))
+    if command == "detect_screen":
+        return detect_screen(
+            str(payload.get("imageBase64", "")),
+            payload.get("screenCorners"),
+            str(payload.get("screenCornerSource", "manual")),
+        )
     if command == "engine_start":
         return TRAINING.start(
             str(payload.get("projectPath", "")),

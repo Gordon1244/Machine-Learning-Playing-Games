@@ -39,6 +39,16 @@ const state = {
   cameraOpening: false,
   cameraLastError: "",
   cameraDeviceLabel: "",
+  screenDetected: false,
+  screenConfidence: 0,
+  screenCorners: [
+    { x: 0.06, y: 0.08 },
+    { x: 0.94, y: 0.08 },
+    { x: 0.94, y: 0.92 },
+    { x: 0.06, y: 0.92 }
+  ],
+  screenCornerSource: "none",
+  screenCornersManual: false,
   serialPort: null,
   trainingSeconds: 0,
   bestScore: 0,
@@ -341,23 +351,33 @@ function renderCameraCalibration() {
   const cameraStatus = state.cameraConnected ? "已授權" : "未開啟";
   const previewStatus = state.cameraReady ? "已顯示" : "未顯示";
   const calibrationStatus = state.cameraCalibrated ? "已確認" : "未確認";
+  const screenStatus = state.screenDetected ? "已框住" : state.cameraReady ? "偵測中" : "等待鏡頭";
+  const screenNote = state.screenDetected
+    ? `${state.screenCornersManual ? "使用手動四角" : "已鎖定自動偵測四角"}，信心 ${Math.round(state.screenConfidence * 100)}%`
+    : "偵測不到時，可直接拖曳四個角到螢幕邊緣";
   return `
     <p class="step-copy">把攝影機對準 Switch 2 螢幕或掌機畫面。系統必須真的取得鏡頭畫面後，才允許你確認校正。${helpIcon("cameraCalibration", "鏡頭校正說明")}</p>
     ${window.isSecureContext ? "" : `<div class="alert">目前不是安全的瀏覽器環境，鏡頭預覽可能無法播放。請改用 <strong>http://localhost:8765</strong> 開啟。</div>`}
     <div class="alert" id="cameraDiagnostic" ${state.cameraLastError ? "" : "hidden"}><strong>鏡頭診斷：</strong><span id="cameraDiagnosticMessage">${escapeHtml(state.cameraLastError)}</span></div>
-    <div class="camera-preview">
+    <div class="camera-preview" id="cameraPreviewFrame">
       <video id="cameraPreview" autoplay playsinline muted></video>
+      <svg class="screen-corner-overlay" id="screenCornerOverlay" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+        <polygon id="screenCornerPolygon" points=""></polygon>
+      </svg>
+      ${state.screenCorners.map((corner, index) => `<button class="screen-corner-handle" type="button" data-screen-corner="${index}" aria-label="移動螢幕${["左上", "右上", "右下", "左下"][index]}角" style="--corner-x:${corner.x};--corner-y:${corner.y}"><span>${index + 1}</span></button>`).join("")}
       <div class="camera-empty" ${state.cameraReady ? "hidden" : ""}>尚未顯示鏡頭畫面</div>
     </div>
     <div class="metric-grid">
       <div class="metric"><span class="status-label">鏡頭狀態</span><strong id="cameraPermissionStatus">${cameraStatus}</strong><p id="cameraPermissionNote">${state.cameraConnected ? escapeHtml(state.cameraDeviceLabel || "瀏覽器已取得鏡頭授權") : "請先按開啟鏡頭"}</p></div>
       <div class="metric"><span class="status-label">預覽畫面</span><strong id="cameraPreviewStatus">${previewStatus}</strong><p id="cameraPreviewNote">${state.cameraReady ? "正在播放真實鏡頭畫面" : "還沒有可確認的影像"}</p></div>
+      <div class="metric"><span class="status-label">螢幕範圍</span><strong id="screenDetectionStatus">${screenStatus}</strong><p id="screenDetectionNote">${screenNote}</p></div>
       <div class="metric"><span class="status-label">畫面確認</span><strong>${calibrationStatus}</strong><p>${state.cameraCalibrated ? "使用者已確認螢幕清楚入鏡" : "尚未確認四角與關鍵資訊"}</p></div>
     </div>
     <div class="step-actions">
       <button class="secondary-button" id="cameraOpenButton" data-action="open-camera" type="button" ${state.cameraOpening ? "disabled" : ""}>${state.cameraOpening ? "正在開啟..." : "開啟鏡頭"}</button>
       <button class="secondary-button" id="cameraCloseButton" data-action="close-camera" type="button" ${state.cameraConnected || state.cameraOpening ? "" : "disabled"}>關閉鏡頭</button>
-      <button class="primary-button" id="cameraConfirmButton" data-action="complete-step" type="button" ${state.cameraReady ? "" : "disabled"}>我確認畫面清楚</button>
+      <button class="secondary-button" id="screenAutoDetectButton" data-action="redetect-screen" type="button" ${state.cameraReady ? "" : "disabled"}>重新自動偵測四角</button>
+      <button class="primary-button" id="cameraConfirmButton" data-action="complete-step" type="button" ${state.cameraReady && state.screenDetected ? "" : "disabled"}>我確認四角正確</button>
       <button class="secondary-button" data-action="camera-tip" type="button">我看不到畫面</button>
     </div>
   `;
@@ -421,6 +441,7 @@ function renderTraining() {
       <div class="metric"><span class="status-label">最近狀態</span><strong>${state.trainingEngineReady ? (state.needsRecalibration ? "需校正" : "待訓練") : "引擎不可用"}</strong><p>${state.trainingEngineReady ? "引擎已接入，等待真實訓練資料" : escapeHtml(state.engineStatusMessage)}</p></div>
       <div class="metric"><span class="status-label">控制器示範</span><strong>${state.demonstrationRecording ? "錄製中" : "待命"}</strong><p>同步保存鏡頭與電腦 Gamepad 操作</p></div>
     </div>
+    ${renderManualController()}
     <div class="step-actions">
       <button class="secondary-button" data-action="toggle-demonstration" type="button">${state.demonstrationRecording ? "停止示範錄製" : "錄製我的操作示範"}</button>
       <button class="secondary-button" data-action="pretrain-demonstrations" type="button" ${state.demonstrationRecording ? "disabled" : ""}>用示範暖身 AI</button>
@@ -430,6 +451,63 @@ function renderTraining() {
       <button class="secondary-button" data-action="${readiness.ok ? "complete-step" : "go-required-step"}" type="button">${readiness.ok ? "進入正式遊玩" : "去完成必要設定"}</button>
     </div>
   `;
+}
+
+function renderManualController() {
+  const manual = getManualControllerReadiness();
+  const manualReady = manual.ok;
+  const button = (input, label, className = "") => `<button class="manual-control-button ${className}" type="button" data-manual-button="${input}" ${manualReady ? "" : "disabled"}>${label}</button>`;
+  return `
+    <section class="manual-controller-panel" aria-labelledby="manualControllerTitle">
+      <div class="manual-controller-heading">
+        <div><h3 id="manualControllerTitle">人工控制手把</h3><p>只在訓練停止時使用，可先進入比賽或完成前置畫面。HOME 與截圖鍵永遠不開放。</p></div>
+        <button class="secondary-button" type="button" data-manual-neutral ${manualReady ? "" : "disabled"}>立即回中立</button>
+      </div>
+      <div class="manual-controller-layout">
+        <div class="manual-stick-group">
+          <strong>左搖桿</strong>
+          <div class="manual-stick" data-manual-stick="left" role="application" aria-label="左搖桿，可拖曳">
+            <span class="manual-stick-knob"></span>
+          </div>
+          ${button("left_stick_press", "按下 LS")}
+        </div>
+        <div class="manual-button-cluster">
+          <strong>方向鍵</strong>
+          <div class="manual-dpad">
+            ${button("dpad_up", "↑", "dpad-up")}
+            ${button("dpad_left", "←", "dpad-left")}
+            ${button("dpad_right", "→", "dpad-right")}
+            ${button("dpad_down", "↓", "dpad-down")}
+          </div>
+          <div class="manual-system-buttons">${button("minus", "−")}${button("plus", "+")}</div>
+        </div>
+        <div class="manual-button-cluster">
+          <strong>基礎按鍵</strong>
+          <div class="manual-face-buttons">${button("x", "X")}${button("y", "Y")}${button("a", "A")}${button("b", "B")}</div>
+          <div class="manual-shoulders">${button("l", "L")}${button("r", "R")}${button("zl", "ZL")}${button("zr", "ZR")}</div>
+        </div>
+        <div class="manual-stick-group">
+          <strong>右搖桿</strong>
+          <div class="manual-stick" data-manual-stick="right" role="application" aria-label="右搖桿，可拖曳">
+            <span class="manual-stick-knob"></span>
+          </div>
+          ${button("right_stick_press", "按下 RS")}
+        </div>
+      </div>
+      <p class="manual-control-status" id="manualControlStatus" role="status">${manualReady ? "可操作。按住按鍵或拖曳搖桿，放開後會自動回中立。" : escapeHtml(manual.message)}</p>
+    </section>
+  `;
+}
+
+function getManualControllerReadiness() {
+  if (state.engineMode !== "idle" || state.controlPaused) return { ok: false, message: "請先停止訓練或正式遊玩，才可人工操作。" };
+  if (!state.emergencyStopOk) return { ok: false, message: "請先完成急停測試，才可人工操作。" };
+  const backend = OUTPUT_BACKEND_PROFILES[state.outputBackend];
+  if (backend.requiresRigCalibration && !canRouteManualPreflight()) {
+    return { ok: false, message: "請先連接開發板、確認外部電源並完成手把校正。" };
+  }
+  if (backend.requiresNxbt && !state.nxbtReady) return { ok: false, message: "請先連接 NXBT 控制器。" };
+  return { ok: true, message: "" };
 }
 
 function renderLivePlay() {
@@ -575,7 +653,12 @@ function bindStepEvents(stepId) {
   }
 
   if (stepId === "live_play") updateStatus();
-  if (stepId === "camera_calibration" && state.cameraStream && !state.cameraOpening) attachCameraPreview();
+  if (stepId === "camera_calibration") {
+    bindScreenCornerControls();
+    updateScreenCornerOverlay();
+    if (state.cameraStream && !state.cameraOpening) attachCameraPreview();
+  }
+  if (stepId === "training") window.ProjectUI?.bindTrainingManualControls(stepContent);
 }
 
 async function handleAction(action) {
@@ -619,6 +702,16 @@ async function handleAction(action) {
 
   if (action === "camera-tip") {
     showToast("請讓螢幕四角都入鏡，並避開反光；若仍失敗，降低房間光源反射。");
+  }
+
+  if (action === "redetect-screen") {
+    state.screenCornersManual = false;
+    state.screenDetected = false;
+    state.screenConfidence = 0;
+    state.screenCornerSource = "none";
+    updateScreenCornerOverlay();
+    showToast("正在重新偵測螢幕四角；請保持鏡頭穩定。偵測不到時可拖曳四個角。 ");
+    await window.ProjectUI?.requestVisionCapture();
   }
 
   if (action === "start-training") {
@@ -706,8 +799,9 @@ function validateCurrentStepBeforeComplete() {
     if (backend.requiresNxbt && !state.nxbtReady) return { ok: false, message: "NXBT 尚未連線，不能完成設備檢查。" };
   }
 
-  if (state.activeStepId === "camera_calibration" && !state.cameraReady) {
-    return { ok: false, message: "沒有真實鏡頭畫面，不能標記鏡頭已校正。" };
+  if (state.activeStepId === "camera_calibration") {
+    if (!state.cameraReady) return { ok: false, message: "沒有真實鏡頭畫面，不能標記鏡頭已校正。" };
+    if (!state.screenDetected) return { ok: false, message: "尚未可靠偵測螢幕四角。請重新自動偵測，或拖曳四個角到螢幕邊緣後等待驗證。" };
   }
 
   if (state.activeStepId === "rig_calibration") {
@@ -745,6 +839,9 @@ async function openCamera() {
   stopAllCameraStreams();
   state.cameraReady = false;
   state.cameraCalibrated = false;
+  state.screenDetected = false;
+  state.screenConfidence = 0;
+  state.screenCornerSource = "none";
   state.cameraLastError = "";
   state.cameraDeviceLabel = "";
   refreshCameraCalibrationView();
@@ -819,7 +916,7 @@ async function attachCameraPreview() {
       showToast(state.cameraLastError);
     } else {
       state.cameraLastError = "";
-    window.ProjectUI?.logEvent("camera_preview_ready", { width: video.videoWidth, height: video.videoHeight, deviceLabel: state.cameraDeviceLabel });
+      window.ProjectUI?.logEvent("camera_preview_ready", { width: video.videoWidth, height: video.videoHeight, deviceLabel: state.cameraDeviceLabel });
       window.ProjectUI?.startVisionCapture();
     }
     refreshCameraCalibrationView();
@@ -847,7 +944,9 @@ function refreshCameraCalibrationView() {
   const previewNote = document.querySelector("#cameraPreviewNote");
   if (previewNote) previewNote.textContent = state.cameraReady ? "正在播放真實鏡頭畫面" : "還沒有可確認的影像";
   const confirmButton = document.querySelector("#cameraConfirmButton");
-  if (confirmButton) confirmButton.disabled = !state.cameraReady;
+  if (confirmButton) confirmButton.disabled = !state.cameraReady || !state.screenDetected;
+  const autoDetectButton = document.querySelector("#screenAutoDetectButton");
+  if (autoDetectButton) autoDetectButton.disabled = !state.cameraReady;
   const openButton = document.querySelector("#cameraOpenButton");
   if (openButton) {
     openButton.disabled = state.cameraOpening;
@@ -859,6 +958,7 @@ function refreshCameraCalibrationView() {
   if (diagnostic) diagnostic.hidden = !state.cameraLastError;
   const diagnosticMessage = document.querySelector("#cameraDiagnosticMessage");
   if (diagnosticMessage) diagnosticMessage.textContent = state.cameraLastError;
+  updateScreenCornerOverlay();
 }
 
 function closeCamera({ broadcast = true, silent = false } = {}) {
@@ -869,6 +969,9 @@ function closeCamera({ broadcast = true, silent = false } = {}) {
   state.cameraConnected = false;
   state.cameraReady = false;
   state.cameraCalibrated = false;
+  state.screenDetected = false;
+  state.screenConfidence = 0;
+  state.screenCornerSource = "none";
   state.cameraLastError = "";
   state.cameraDeviceLabel = "";
   if (broadcast) broadcastStopCamera();
@@ -886,6 +989,9 @@ function handleCameraTrackEnded(stream) {
   state.cameraConnected = false;
   state.cameraReady = false;
   state.cameraCalibrated = false;
+  state.screenDetected = false;
+  state.screenConfidence = 0;
+  state.screenCornerSource = "none";
   state.cameraLastError = "鏡頭串流被瀏覽器或作業系統中斷。請確認沒有其他分頁或程式搶用攝影機，再重新開啟。";
   if (state.engineMode !== "idle") window.ProjectUI?.sendControl("pause");
   window.ProjectUI?.stopVisionCapture();
@@ -926,6 +1032,70 @@ function stopAllCameraStreams() {
     });
   });
   return stoppedTracks;
+}
+
+function validScreenCorners(value) {
+  return Array.isArray(value)
+    && value.length === 4
+    && value.every((point) => Number.isFinite(Number(point?.x)) && Number.isFinite(Number(point?.y)));
+}
+
+function updateScreenCornerOverlay() {
+  const overlay = document.querySelector("#screenCornerOverlay");
+  const polygon = document.querySelector("#screenCornerPolygon");
+  if (overlay) overlay.classList.toggle("verified", state.screenDetected);
+  if (polygon && validScreenCorners(state.screenCorners)) {
+    polygon.setAttribute("points", state.screenCorners.map((point) => `${Number(point.x) * 100},${Number(point.y) * 100}`).join(" "));
+  }
+  document.querySelectorAll("[data-screen-corner]").forEach((handle) => {
+    const corner = state.screenCorners[Number(handle.dataset.screenCorner)];
+    if (!corner) return;
+    handle.style.setProperty("--corner-x", String(corner.x));
+    handle.style.setProperty("--corner-y", String(corner.y));
+    handle.disabled = !state.cameraReady;
+  });
+  const status = document.querySelector("#screenDetectionStatus");
+  if (status) status.textContent = state.screenDetected ? "已框住" : state.cameraReady ? "等待驗證" : "等待鏡頭";
+  const note = document.querySelector("#screenDetectionNote");
+  if (note) note.textContent = state.screenDetected
+    ? `${state.screenCornersManual ? "使用手動四角" : "已鎖定自動偵測四角"}，信心 ${Math.round(state.screenConfidence * 100)}%`
+    : state.cameraReady ? "可拖曳四個角到螢幕邊緣，放開後會立即驗證" : "開啟鏡頭後才會偵測";
+}
+
+function bindScreenCornerControls() {
+  const frame = document.querySelector("#cameraPreviewFrame");
+  if (!frame) return;
+  document.querySelectorAll("[data-screen-corner]").forEach((handle) => {
+    handle.addEventListener("pointerdown", (event) => {
+      if (!state.cameraReady) return;
+      event.preventDefault();
+      const index = Number(handle.dataset.screenCorner);
+      handle.setPointerCapture(event.pointerId);
+      const move = (pointerEvent) => {
+        const box = frame.getBoundingClientRect();
+        if (!box.width || !box.height) return;
+        state.screenCorners[index] = {
+          x: Math.min(0.995, Math.max(0.005, (pointerEvent.clientX - box.left) / box.width)),
+          y: Math.min(0.995, Math.max(0.005, (pointerEvent.clientY - box.top) / box.height))
+        };
+        state.screenCornersManual = true;
+        state.screenDetected = false;
+        state.screenConfidence = 0;
+        state.cameraCalibrated = false;
+        updateScreenCornerOverlay();
+      };
+      const finish = async () => {
+        handle.removeEventListener("pointermove", move);
+        handle.removeEventListener("pointerup", finish);
+        handle.removeEventListener("pointercancel", finish);
+        emitStateChange();
+        await window.ProjectUI?.requestVisionCapture();
+      };
+      handle.addEventListener("pointermove", move);
+      handle.addEventListener("pointerup", finish, { once: true });
+      handle.addEventListener("pointercancel", finish, { once: true });
+    });
+  });
 }
 
 async function connectDevelopmentBoard() {
@@ -1109,12 +1279,21 @@ function canRouteEngineAction() {
   return !state.controlPaused && getCurrentSafetyGate().ok && (state.trainingEngineReady || state.liveEngineReady);
 }
 
-async function routeRigAction(command, { manualDemonstration = false } = {}) {
+function canRouteManualPreflight() {
+  const backend = OUTPUT_BACKEND_PROFILES[state.outputBackend];
+  if (state.engineMode !== "idle" || state.controlPaused || !state.emergencyStopOk) return false;
+  if (!backend?.requiresRigCalibration) return false;
+  return state.connectionOk
+    && state.externalPowerOk
+    && state.calibratedSlotIds.size >= state.rigConfig.slots.length;
+}
+
+async function routeRigAction(command, { manualDemonstration = false, manualPreflight = false } = {}) {
   const manualAllowed = manualDemonstration
     && state.engineMode === "idle"
     && !state.controlPaused
     && getCurrentSafetyGate().ok;
-  if (!(manualAllowed || canRouteEngineAction())) {
+  if (!(manualAllowed || (manualPreflight && canRouteManualPreflight()) || canRouteEngineAction())) {
     throw new Error("安全閘門未通過，已阻止機械治具動作。");
   }
   const clamped = clampActionCommand({ ...command, sticks: { ...(command.sticks || {}) }, buttons: { ...(command.buttons || {}) } }, state.rigConfig);
@@ -1167,7 +1346,21 @@ function setLatestGameState(gameState = {}) {
   state.latestGameState = gameState;
   if (Number.isFinite(Number(gameState.learningScore))) state.currentScore = Number(gameState.learningScore);
   if (state.currentScore > state.bestScore) state.bestScore = state.currentScore;
-  state.needsRecalibration = gameState.confidence !== undefined && Number(gameState.confidence) < 0.45;
+  if (validScreenCorners(gameState.screenCorners)) {
+    state.screenCorners = gameState.screenCorners.map((point) => ({
+      x: Math.min(1, Math.max(0, Number(point.x))),
+      y: Math.min(1, Math.max(0, Number(point.y)))
+    }));
+  }
+  if (gameState.cornerSource) state.screenCornerSource = String(gameState.cornerSource);
+  if (gameState.screenConfidence !== undefined) state.screenConfidence = Number(gameState.screenConfidence) || 0;
+  if (gameState.ready !== undefined) {
+    state.screenDetected = Boolean(gameState.ready);
+    state.needsRecalibration = !state.screenDetected;
+    if (!state.screenDetected) state.cameraCalibrated = false;
+  }
+  updateScreenCornerOverlay();
+  refreshCameraCalibrationView();
   updateStatus();
 }
 
@@ -1276,6 +1469,8 @@ function getPersistentState(saveReason = "autosave") {
     currentScore: state.currentScore,
     previousStableScore: state.previousStableScore,
     needsRecalibration: state.needsRecalibration,
+    screenCorners: state.screenCorners.map((point) => ({ x: point.x, y: point.y })),
+    screenCornersManual: state.screenCornersManual,
     importedVideoName: state.importedVideoName,
     livePolicy: JSON.parse(JSON.stringify(state.livePolicy)),
     saveReason
@@ -1291,6 +1486,9 @@ async function loadPersistentState(projectId, saved = {}) {
   state.cameraConnected = false;
   state.cameraReady = false;
   state.cameraCalibrated = false;
+  state.screenDetected = false;
+  state.screenConfidence = 0;
+  state.screenCornerSource = "none";
   state.cameraLastError = "";
   state.cameraDeviceLabel = "";
   state.connectionOk = false;
@@ -1318,6 +1516,10 @@ async function loadPersistentState(projectId, saved = {}) {
   state.currentScore = Number(saved.currentScore) || 0;
   state.previousStableScore = Number(saved.previousStableScore) || 0;
   state.needsRecalibration = Boolean(saved.needsRecalibration);
+  if (validScreenCorners(saved.screenCorners)) {
+    state.screenCorners = saved.screenCorners.map((point) => ({ x: Number(point.x), y: Number(point.y) }));
+  }
+  state.screenCornersManual = Boolean(saved.screenCornersManual);
   state.importedVideoName = typeof saved.importedVideoName === "string" ? saved.importedVideoName : "";
   state.livePolicy = saved.livePolicy && Array.isArray(saved.livePolicy.modes)
     ? JSON.parse(JSON.stringify(saved.livePolicy))
@@ -1406,6 +1608,7 @@ window.AppRuntime = {
   closeCamera,
   closeSerialPort,
   canRouteEngineAction,
+  canRouteManualPreflight,
   routeRigAction,
   routeRigNeutral,
   sendBoardEmergencyStop,

@@ -113,6 +113,36 @@ class NxbtBridgeTest(unittest.TestCase):
         self.assertTrue(fake.packets[0][1]["A"])
         self.assertFalse(fake.packets[-1][1]["A"])
 
+    def test_test_input_uses_nxbt_high_level_helpers_for_special_buttons_and_sticks(self):
+        class FakeModule:
+            class Sticks:
+                LEFT_STICK = "LEFT"
+                RIGHT_STICK = "RIGHT"
+
+        class FakeNx:
+            def __init__(self):
+                self.button_calls = []
+                self.stick_calls = []
+
+            def press_buttons(self, controller_index, buttons, **timing):
+                self.button_calls.append((controller_index, buttons, timing))
+
+            def tilt_stick(self, controller_index, stick, x, y, **timing):
+                self.stick_calls.append((controller_index, stick, x, y, timing))
+
+        fake = FakeNx()
+        session = bridge.NxbtSession(FakeModule, fake, 7)
+        for operation in ("dpad_up", "plus", "minus", "left_stick_press", "right_stick_press"):
+            session.apply_test_input(operation, {"durationMs": 120, "buttons": {operation: True}, "sticks": {}})
+        session.apply_test_input("left:up", {"durationMs": 350, "buttons": {}, "sticks": {"left_stick_y": 100}})
+        session.apply_test_input("right:down", {"durationMs": 350, "buttons": {}, "sticks": {"right_stick_y": -100}})
+
+        self.assertEqual([call[1][0] for call in fake.button_calls], [
+            "DPAD_UP", "PLUS", "MINUS", "L_STICK_PRESS", "R_STICK_PRESS",
+        ])
+        self.assertEqual(fake.stick_calls[0][1:4], ("LEFT", 0, 100))
+        self.assertEqual(fake.stick_calls[1][1:4], ("RIGHT", 0, -100))
+
 
 if __name__ == "__main__":
     unittest.main()

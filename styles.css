@@ -543,6 +543,8 @@ h3 {
   position: relative;
   display: grid;
   place-items: center;
+  width: 100%;
+  aspect-ratio: 16 / 9;
   min-height: 260px;
   margin-bottom: 14px;
   border: 1px solid var(--line);
@@ -553,8 +555,59 @@ h3 {
 
 .camera-preview video {
   width: 100%;
-  max-height: 360px;
-  object-fit: contain;
+  height: 100%;
+  object-fit: fill;
+}
+
+.screen-corner-overlay {
+  position: absolute;
+  z-index: 2;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.screen-corner-overlay polygon {
+  fill: rgba(245, 158, 11, 0.08);
+  stroke: #f59e0b;
+  stroke-width: 0.8;
+  vector-effect: non-scaling-stroke;
+}
+
+.screen-corner-overlay.verified polygon {
+  fill: rgba(16, 185, 129, 0.08);
+  stroke: #10b981;
+}
+
+.screen-corner-handle {
+  position: absolute;
+  z-index: 3;
+  left: calc(var(--corner-x) * 100%);
+  top: calc(var(--corner-y) * 100%);
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 3px solid #fff;
+  border-radius: 50%;
+  color: #fff;
+  background: #d97706;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.45);
+  font-size: 12px;
+  font-weight: 800;
+  transform: translate(-50%, -50%);
+  touch-action: none;
+}
+
+.screen-corner-overlay.verified ~ .screen-corner-handle {
+  background: #047857;
+}
+
+.screen-corner-handle:disabled {
+  cursor: default;
+  opacity: 0.45;
 }
 
 .camera-empty {
@@ -569,6 +622,139 @@ h3 {
 
 .camera-empty[hidden] {
   display: none;
+}
+
+.manual-controller-panel {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #f8faf9;
+}
+
+.manual-controller-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.manual-controller-heading h3,
+.manual-controller-heading p {
+  margin: 0 0 6px;
+}
+
+.manual-controller-heading p,
+.manual-control-status {
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.manual-controller-layout {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.manual-stick-group,
+.manual-button-cluster {
+  display: grid;
+  align-content: start;
+  justify-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.manual-stick {
+  position: relative;
+  width: min(150px, 100%);
+  aspect-ratio: 1;
+  border: 2px solid #82908c;
+  border-radius: 50%;
+  background: #dce4e1;
+  box-shadow: inset 0 0 0 20px #edf2f0;
+  touch-action: none;
+  cursor: crosshair;
+}
+
+.manual-stick::before,
+.manual-stick::after {
+  content: "";
+  position: absolute;
+  inset: 50% 10%;
+  height: 1px;
+  background: #a4b0ac;
+}
+
+.manual-stick::after {
+  inset: 10% 50%;
+  width: 1px;
+  height: auto;
+}
+
+.manual-stick-knob {
+  position: absolute;
+  z-index: 1;
+  left: calc(50% - 22px);
+  top: calc(50% - 22px);
+  width: 44px;
+  height: 44px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: #25332f;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.28);
+  pointer-events: none;
+}
+
+.manual-control-button {
+  min-width: 46px;
+  min-height: 40px;
+  padding: 8px 10px;
+  border: 1px solid #8e9a96;
+  border-radius: 6px;
+  color: var(--ink);
+  background: #fff;
+  font-weight: 800;
+  touch-action: none;
+}
+
+.manual-control-button:active {
+  color: #fff;
+  background: var(--accent-dark);
+}
+
+.manual-dpad {
+  display: grid;
+  grid-template-columns: repeat(3, 46px);
+  grid-template-rows: repeat(3, 40px);
+  gap: 4px;
+}
+
+.manual-dpad .dpad-up { grid-column: 2; grid-row: 1; }
+.manual-dpad .dpad-left { grid-column: 1; grid-row: 2; }
+.manual-dpad .dpad-right { grid-column: 3; grid-row: 2; }
+.manual-dpad .dpad-down { grid-column: 2; grid-row: 3; }
+
+.manual-system-buttons,
+.manual-face-buttons,
+.manual-shoulders {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(46px, 1fr));
+  gap: 8px;
+}
+
+.manual-face-buttons {
+  grid-template-columns: repeat(2, 52px);
+}
+
+.manual-control-status {
+  min-height: 24px;
+  margin: 14px 0 0;
+}
+
+.manual-control-status.error {
+  color: var(--danger);
 }
 
 .metric {
@@ -1060,8 +1246,26 @@ h3 {
     margin-left: 0;
   }
 
+  .manual-controller-layout {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .app-shell {
     width: min(100% - 20px, 1180px);
     padding-top: 12px;
+  }
+}
+
+@media (max-width: 520px) {
+  .camera-preview {
+    min-height: 180px;
+  }
+
+  .manual-controller-heading {
+    flex-direction: column;
+  }
+
+  .manual-controller-layout {
+    grid-template-columns: 1fr;
   }
 }

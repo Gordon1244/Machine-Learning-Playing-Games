@@ -41,8 +41,7 @@ class StoreTest(unittest.TestCase):
         app.STORE = self.store
 
     def tearDown(self):
-        if hasattr(self.store.services.worker, "shutdown"):
-            self.store.services.worker.shutdown()
+        self.store.services.shutdown()
         for key, value in self.originals.items():
             setattr(app, key, value)
         self.temp.cleanup()
@@ -50,10 +49,11 @@ class StoreTest(unittest.TestCase):
     def test_state_save_strips_runtime_hardware_and_snapshot_restores(self):
         project = self.store.create_project({"name": "Mario Kart World"})
         project_id = project["manifest"]["id"]
-        self.store.save_state(project_id, {"bestScore": 42, "cameraConnected": True, "connectionOk": True, "externalPowerOk": True})
+        self.store.save_state(project_id, {"bestScore": 42, "cameraConnected": True, "screenDetected": True, "connectionOk": True, "externalPowerOk": True})
         state = self.store.load_project(project_id)["state"]
         self.assertEqual(state["bestScore"], 42)
         self.assertNotIn("cameraConnected", state)
+        self.assertNotIn("screenDetected", state)
         self.assertNotIn("connectionOk", state)
         self.assertNotIn("externalPowerOk", state)
         snapshot = self.store.create_snapshot(project_id, {"name": "stable"})
@@ -193,6 +193,7 @@ class StoreTest(unittest.TestCase):
     def test_nxbt_connector_is_private_ephemeral_and_emergency_stop_removes_it(self):
         project = self.store.create_project({"name": "NXBT"})
         project_id = project["manifest"]["id"]
+        self.store.put_project_settings(project_id, {"output": {"backend": "nxbt_bluetooth"}})
         requests = []
 
         def fake_request(connector, path, payload=None, timeout=5):
@@ -230,6 +231,7 @@ class StoreTest(unittest.TestCase):
     def test_nxbt_action_is_backend_gated_and_rejects_locked_buttons(self):
         project = self.store.create_project({"name": "NXBT gated"})
         project_id = project["manifest"]["id"]
+        self.store.put_project_settings(project_id, {"output": {"backend": "nxbt_bluetooth"}})
         sent = []
         self.store.nxbt_connectors[project_id] = {"host": "127.0.0.1", "port": 8766, "token": "private"}
         self.store.nxbt_request = lambda connector, path, payload=None, timeout=5: sent.append((path, payload)) or {"ok": True}
@@ -243,6 +245,13 @@ class StoreTest(unittest.TestCase):
         runtime["emergencyStopVerified"] = True
         self.store.action_nxbt(project_id, {"buttons": {"a": True}}, manual_demonstration=True)
         self.assertEqual(sent[-1][0], "/action")
+        self.store.action_nxbt(project_id, {"manualControl": True, "buttons": {"plus": True}})
+        self.assertEqual(sent[-1][0], "/test-input")
+        self.assertEqual(sent[-1][1]["operation"], "plus")
+        runtime["visionReady"] = False
+        self.store.action_nxbt(project_id, {"manualControl": True, "sticks": {"left_stick_y": -80}})
+        self.assertEqual(sent[-1][0], "/action")
+        runtime["visionReady"] = True
         self.store.action_nxbt(project_id, {"durationMs": 999, "buttons": {"dpad_right": True}}, menu_action=True)
         self.assertEqual(sent[-1][1]["durationMs"], 250)
         self.assertTrue(sent[-1][1]["buttons"]["dpad_right"])
@@ -277,6 +286,9 @@ class StoreTest(unittest.TestCase):
             self.store.test_nxbt_input(project_id, {"interface": "buttons", "operation": "a", "screenConfirmed": False})
         with self.assertRaises(app.ApiError):
             self.store.test_nxbt_input(project_id, {"interface": "sticks", "operation": "left:up", "screenConfirmed": True})
+        with self.assertRaises(app.ApiError):
+            self.store.test_nxbt_input(project_id, {"interface": "buttons", "operation": "a", "screenConfirmed": True})
+        runtime["emergencyStopVerified"] = True
 
         self.store.nxbt_request = lambda connector, path, payload=None, timeout=5: {"ok": False}
         with self.assertRaises(app.ApiError):
@@ -286,16 +298,17 @@ class StoreTest(unittest.TestCase):
 
         prepared = self.store.test_nxbt_input(project_id, {"interface": "sticks", "operation": "left:prepare", "screenConfirmed": True})
         self.assertTrue(prepared["ok"])
-        self.assertEqual(sent[-1][1]["durationMs"], 1200)
-        self.assertEqual(sent[-1][1]["sticks"]["left_stick_x"], 100)
+        self.assertEqual(sent[-1][0], "/test-input")
+        self.assertEqual(sent[-1][1]["action"]["durationMs"], 1200)
+        self.assertEqual(sent[-1][1]["action"]["sticks"]["left_stick_x"], 100)
         self.store.test_nxbt_input(project_id, {"interface": "sticks", "operation": "left:up", "screenConfirmed": True})
-        self.assertEqual(sent[-1][1]["durationMs"], 350)
-        self.assertEqual(sent[-1][1]["sticks"]["left_stick_y"], -100)
+        self.assertEqual(sent[-1][1]["action"]["durationMs"], 350)
+        self.assertEqual(sent[-1][1]["action"]["sticks"]["left_stick_y"], 100)
         self.store.test_nxbt_input(project_id, {"interface": "buttons", "operation": "left_stick_press", "screenConfirmed": True})
-        self.assertTrue(sent[-1][1]["buttons"]["left_stick_press"])
+        self.assertTrue(sent[-1][1]["action"]["buttons"]["left_stick_press"])
         self.store.test_nxbt_input(project_id, {"interface": "buttons", "operation": "finish_button_test", "screenConfirmed": True})
-        self.assertEqual(sent[-1][1]["durationMs"], 1000)
-        self.assertTrue(sent[-1][1]["buttons"]["b"])
+        self.assertEqual(sent[-1][1]["action"]["durationMs"], 1000)
+        self.assertTrue(sent[-1][1]["action"]["buttons"]["b"])
 
         with self.assertRaises(app.ApiError):
             self.store.test_nxbt_input(project_id, {"interface": "buttons", "operation": "home", "screenConfirmed": True})
@@ -315,6 +328,9 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(runtime["steps"], 12)
         self.assertTrue(runtime["shadowReady"])
         self.assertTrue(runtime["awaitingNextRound"])
+        runtime["visionReady"] = True
+        self.store.apply_engine_status(project_id, {"ready": True, "ocr": False, "message": "OCR package unavailable"})
+        self.assertTrue(runtime["visionReady"], "OCR availability must not overwrite verified screen detection")
 
     def test_nxbt_failed_emergency_stop_keeps_connector_for_retry(self):
         project = self.store.create_project({"name": "NXBT retry"})
@@ -448,7 +464,9 @@ class ApiTest(StoreTest):
         self.store.nxbt_connectors[project_id] = {"host": "127.0.0.1", "port": 8766, "token": "private"}
         sent = []
         self.store.nxbt_request = lambda connector, path, payload=None, timeout=5: sent.append((path, payload)) or {"ok": True}
-        self.store.runtime_status(project_id)["controllerReady"] = True
+        runtime = self.store.runtime_status(project_id)
+        runtime["controllerReady"] = True
+        runtime["emergencyStopVerified"] = True
 
         status, result = self.request(
             "POST",
@@ -457,8 +475,9 @@ class ApiTest(StoreTest):
         )
         self.assertEqual(status, 200)
         self.assertTrue(result["ok"])
-        self.assertEqual(sent[-1][0], "/action")
-        self.assertTrue(sent[-1][1]["buttons"]["a"])
+        self.assertEqual(sent[-1][0], "/test-input")
+        self.assertEqual(sent[-1][1]["operation"], "a")
+        self.assertTrue(sent[-1][1]["action"]["buttons"]["a"])
 
     def test_shutdown_route_requires_auth_and_stops_http_server(self):
         with self.assertRaises(urllib.error.HTTPError) as denied:
@@ -559,16 +578,31 @@ class ApiTest(StoreTest):
 
         class FakeWorker:
             def call(self, command, payload=None):
+                if command == "detect_screen":
+                    return {
+                        "screenDetected": True,
+                        "screenConfidence": 0.9,
+                        "screenCorners": [
+                            {"x": 0.05, "y": 0.05}, {"x": 0.95, "y": 0.05},
+                            {"x": 0.95, "y": 0.95}, {"x": 0.05, "y": 0.95},
+                        ],
+                        "cornerSource": "auto",
+                        "processedImageBase64": (payload or {}).get("imageBase64", ""),
+                    }
                 if command == "ocr":
                     return {"ready": True, "rank": 1, "confidence": 0.9, "message": "OCR ok"}
                 if command == "engine_frame":
                     return {"ready": False, "action": None}
                 return {"workerReady": True}
 
-        self.store.services.worker = FakeWorker()
+        fake_worker = FakeWorker()
+        self.store.services.worker = fake_worker
+        self.store.services.ocr_worker = fake_worker
+        self.store.services.latest_ocr[project_id] = {"rank": 1, "ocrConfidence": 0.9, "ocrReady": True}
         jpeg = base64.b64encode(b"\xff\xd8\xff\xe0api-test").decode("ascii")
         _, frame = self.request("POST", f"/api/projects/{project_id}/vision/frame", {"imageBase64": jpeg})
         self.assertEqual(frame["state"]["rank"], 1)
+        self.assertTrue(frame["state"]["ready"])
         _, cleared = self.request("DELETE", f"/api/projects/{project_id}/assistant/chat", {})
         self.assertTrue(cleared["ok"])
 

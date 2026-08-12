@@ -16,7 +16,7 @@ macOS 或 Linux 如果第一次執行時被系統阻擋，先在終端機執行�
 chmod +x start-macos.command start-linux.sh
 ```
 
-不要直接用 `file://` 開啟 `index.html`。鏡頭權限取決於瀏覽器安全政策，系統不會在未取得真實鏡頭預覽畫面時假裝校正成功。鏡頭頁也提供「關閉鏡頭」，會停止 camera tracks 並清除校正狀態。
+不要直接用 `file://` 開啟 `index.html`。鏡頭權限取決於瀏覽器安全政策，系統不會在未取得真實鏡頭預覽畫面時假裝校正成功。鏡頭頁會以四角框顯示實際偵測到的螢幕範圍；綠色代表後端已驗證。自動偵測不準時，可拖曳編號 1 至 4 的四個角到螢幕邊緣，放開後系統會做透視裁切並重新驗證。鏡頭頁也提供「關閉鏡頭」，會停止 camera tracks 並清除本次校正狀態。
 
 只關閉瀏覽器分頁不會自動停止 localhost 後端。正常結束時，請按網頁上方的 `結束程式`，確認後系統會停止訓練與控制、回到中立、釋放鏡頭與 Serial、斷開 NXBT，最後關閉 localhost 伺服器。看到「程式已結束」後即可關閉分頁。
 
@@ -38,6 +38,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 - 即時自我修正模式：安全適應、全程即時更新、旁邊偷偷練習的備用 AI
 - 安全閘門：急停、行程限制、最大按壓時間、失聯歸零、異常動作偵測
 - 可選 NXBT 輸出後端：機械治具、NXBT 藍牙控制、混合模式
+- 訓練頁人工控制：在訓練停止時，可操作雙搖桿、方向鍵、A/B/X/Y、L/R/ZL/ZR、`+/-` 與左右搖桿按下，以完成進入遊戲等前置作業；HOME 與截圖鍵永久禁止
 
 這版已具備本機專案記憶、快照、ZIP 備份、日志、進階設定中心、即時監控、AI 助手、OCR 畫格處理，以及隔離 worker 內的 Stable-Baselines3 PPO 視覺融合訓練路徑。PPO 使用 4 張連續灰階畫格交給 CNN，再把 CNN 特徵與速度、進度、排名、辨識信心、碰撞、落後、失敗及學習分數融合後決定雙搖桿與安全按鍵。系統不會把未連線的攝影機、開發板、急停、OCR 套件或訓練套件顯示為正常。實機配對、辨識品質與自學效果仍必須用 Switch 2、遊戲畫面、藍牙或治具驗證後才能確認。
 
@@ -307,7 +308,9 @@ sudo kill 顯示的_python3_PID
 
 NXBT 只模擬 Switch Pro Controller，因此選擇 NXBT 或混合輸出時，程式會自動鎖定為 `Switch 2 Pro 手把`，不提供 Joy-Con 2 握把選項。要使用 Joy-Con 2 握把，必須改用純機械治具輸出。
 
-NXBT 連線完成後，到網頁的「完整手把校正」按 `測試 NXBT 按鍵與搖桿`。這個面板只在訓練與正式遊玩都停止時允許送出測試動作，每個動作結束後都會回中立。
+NXBT 連線且軟體急停測試完成後，到網頁的「完整手把校正」按 `測試 NXBT 按鍵與搖桿`。這個面板只在訓練與正式遊玩都停止時允許送出測試動作，每個動作結束後都會回中立；未驗證急停時，所有非中立測試都會被阻止。
+
+這個測試面板使用最新版 bridge 的 `/test-input`，並呼叫 NXBT 官方高階 `press_buttons`／`tilt_stick` API。若網頁提示 bridge 版本太舊，請重新執行上方「複製 bridge 到 NXBT VM」的兩個 `cp` 指令，同時覆蓋 `tools/nxbt_bridge.py` 與 `tools/nxbt_bridge_server.py`，再用 `Ctrl+C` 停止舊 bridge 並重新啟動。只更新 localhost 網頁而沒有更新 VM 內這兩個檔案，方向鍵、`+/-`、左右搖桿按下或搖桿方向仍可能無法正確測試。
 
 按鍵測試前，先在 Switch 2 開啟：`HOME 選單 → 主機設定 → 控制器與周邊設備 → 測試輸入裝置 → 測試控制器按鍵`。勾選網頁確認框後，再逐一測試方向鍵、A/B/X/Y、L/R/ZL/ZR、`+`、`-` 與左右搖桿按下。Nintendo 官方說明指出 HOME、截圖、C、POWER、音量與 SYNC 不會出現在這個測試；本程式也不允許從測試面板送出 HOME、截圖、C、GL 或 GR。結束官方按鍵測試時，可使用面板的 `按住 B，結束官方按鍵測試`。[Nintendo Switch 2 按鍵測試說明](https://en-americas-support.nintendo.com/app/answers/detail/a_id/68213)
 
@@ -315,7 +318,7 @@ NXBT 連線完成後，到網頁的「完整手把校正」按 `測試 NXBT 按�
 
 token 只保留在 localhost 後端記憶體，不會寫入專案、快照、匯出檔或日志。只在可信任的私人網路開放 bridge，並確認 VM 防火牆允許 TCP `8766`。
 
-HTTP VM bridge 提供 `/health`、`/connect`、`/disconnect`、`/emergency-stop` 與 `/action`；localhost 後端另以 `/nxbt/test-input` 執行白名單測試。所有 bridge 路徑都需要 Bearer token。本機網頁後端只接受 `localhost` 或私人 IPv4，避免把 token 送到公開位址。
+HTTP VM bridge 提供 `/health`、`/connect`、`/disconnect`、`/emergency-stop`、`/action` 與 `/test-input`；localhost 後端以 `/nxbt/test-input` 執行白名單測試。所有 bridge 路徑都需要 Bearer token。本機網頁後端只接受 `localhost` 或私人 IPv4，避免把 token 送到公開位址。
 
 進階診斷時可以在宿主機的 `nxbt` 資料夾執行 `vagrant ssh -c "hostname -I"` 查詢 VM 網路位址。但 VirtualBox 預設顯示的 `10.0.2.15` 通常是 NAT 位址，Windows 與 macOS 一般流程不要將它填入網頁。
 

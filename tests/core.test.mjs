@@ -366,8 +366,16 @@ test("UI source does not expose fake hardware or fake training success paths", (
   assert.equal(appSource.includes("async function routeRigNeutral()"), true);
   assert.equal(appSource.includes("cameraDiagnosticMessage"), true);
   assert.equal(appSource.includes('"camera_open_failed"'), true);
+  assert.equal(appSource.includes('data-screen-corner="${index}"'), true);
+  assert.equal(appSource.includes("bindScreenCornerControls()"), true);
+  assert.equal(appSource.includes("state.screenDetected"), true);
+  assert.equal(appSource.includes('data-manual-stick="left"'), true);
+  assert.equal(appSource.includes('data-manual-button="${input}"'), true);
+  assert.equal(appSource.includes("manualPreflight"), true);
   assert.equal(appSource.includes('tooltip.setAttribute("popover", "manual")'), true);
   assert.equal(stylesSource.includes(".camera-empty[hidden]"), true);
+  assert.equal(stylesSource.includes(".screen-corner-handle"), true);
+  assert.equal(stylesSource.includes(".manual-controller-layout"), true);
   assert.equal(stylesSource.includes(".floating-tooltip"), true);
 });
 

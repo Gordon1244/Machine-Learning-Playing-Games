@@ -48,6 +48,13 @@ class NxbtBridgeServerTest(unittest.TestCase):
         result = self.request("/action", {"buttons": {"a": True}, "sticks": {"left_stick_x": 999}, "durationMs": 5000})
         self.assertEqual(result["action"]["sticks"]["left_stick_x"], 100)
         self.assertEqual(result["action"]["durationMs"], 1500)
+        tested = self.request("/test-input", {
+            "operation": "plus",
+            "action": {"buttons": {"plus": True}, "sticks": {}, "durationMs": 120},
+        })
+        self.assertTrue(tested["ok"])
+        self.assertEqual(tested["operation"], "plus")
+        self.assertTrue(tested["action"]["buttons"]["plus"])
         stopped = self.request("/emergency-stop", {})
         self.assertTrue(stopped["emergencyStopVerified"])
         self.assertFalse(stopped["controllerReady"])

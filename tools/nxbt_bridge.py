@@ -3,14 +3,15 @@
 This script is intentionally small and line-oriented. A future desktop backend
 can spawn it and send ActionCommand-shaped JSON lines over stdin. It requires
 Linux, a compatible Bluetooth adapter, BlueZ, and the third-party `nxbt`
-    package installed in that environment. Windows and macOS hosts should run
-    this bridge inside the Linux VM described by NXBT's official guide.
+package installed in that environment. Windows and macOS hosts should run this
+bridge inside the Linux VM described by NXBT's official guide.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import threading
 import time
@@ -120,6 +121,34 @@ class NxbtSession:
         self.nx.set_controller_input(self.controller_index, neutral)
         return completed
 
+    def apply_test_input(self, operation: str, action: dict[str, Any]) -> None:
+        action = normalize_action(action)
+        pressed = [key for key, value in action["buttons"].items() if value]
+        active_sticks = {key: value for key, value in action["sticks"].items() if value}
+        duration = action["durationMs"] / 1000
+        if len(pressed) == 1 and not active_sticks:
+            self.nx.press_buttons(
+                self.controller_index,
+                [BUTTON_MAP[pressed[0]]],
+                down=duration,
+                up=0.12,
+            )
+            return
+        match = re.fullmatch(r"(left|right):(prepare|left|right|up|down)", operation)
+        if match and len(active_sticks) == 1:
+            side = match.group(1)
+            prefix = f"{side}_stick"
+            self.nx.tilt_stick(
+                self.controller_index,
+                self.nxbt_module.Sticks.LEFT_STICK if side == "left" else self.nxbt_module.Sticks.RIGHT_STICK,
+                int(action["sticks"][f"{prefix}_x"]),
+                int(action["sticks"][f"{prefix}_y"]),
+                tilted=duration,
+                released=0.12,
+            )
+            return
+        raise ValueError("NXBT test input must contain one button or one stick direction.")
+
     def _build_input_packet(self, action: dict[str, Any]) -> dict[str, Any]:
         packet = self.nx.create_input_packet()
         for key, pressed in action.get("buttons", {}).items():
@@ -134,8 +163,8 @@ class NxbtSession:
         sticks = action.get("sticks", {})
         for packet_key, prefix in (("L_STICK", "left_stick"), ("R_STICK", "right_stick")):
             packet[packet_key]["X_VALUE"] = int(sticks.get(f"{prefix}_x", 0) or 0)
-            # Browser Gamepad axes use positive Y for down; NXBT uses positive Y
-            # for up. The bridge is the single coordinate conversion boundary.
+            # Browser pointer/gamepad axes use positive Y for down, while NXBT
+            # uses positive Y for up. Convert exactly once at this boundary.
             packet[packet_key]["Y_VALUE"] = -int(sticks.get(f"{prefix}_y", 0) or 0)
         return packet
 

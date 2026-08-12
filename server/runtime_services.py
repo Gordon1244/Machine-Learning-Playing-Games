@@ -208,9 +208,10 @@ class OfflineIntentParser:
 
 
 class WorkerClient:
-    def __init__(self, runtime_root: Path, source_root: Path) -> None:
+    def __init__(self, runtime_root: Path, source_root: Path, name: str = "worker") -> None:
         self.runtime_root = runtime_root
         self.source_root = source_root
+        self.name = re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-") or "worker"
         self.process: subprocess.Popen[str] | None = None
         self.stderr_handle: Any = None
         self.lock = threading.RLock()
@@ -225,7 +226,7 @@ class WorkerClient:
             return
         self.release_process()
         self.runtime_root.mkdir(parents=True, exist_ok=True)
-        self.stderr_handle = (self.runtime_root / "worker-stderr.log").open("a", encoding="utf-8")
+        self.stderr_handle = (self.runtime_root / f"{self.name}-stderr.log").open("a", encoding="utf-8")
         worker_environment = os.environ.copy()
         worker_environment["PYTHONIOENCODING"] = "utf-8"
         worker_environment["PYTHONUTF8"] = "1"
@@ -297,7 +298,7 @@ class WorkerClient:
             except BaseException as read_error:
                 responses.put(("", read_error))
 
-        threading.Thread(target=read_line, daemon=True, name="local-engine-response").start()
+        threading.Thread(target=read_line, daemon=True, name=f"local-{self.name}-response").start()
         try:
             line, read_error = responses.get(timeout=timeout_seconds)
         except queue.Empty as timeout_error:
@@ -349,7 +350,11 @@ class RuntimeServices:
         self.secret_path = data / "llm-api-key.dpapi"
         self.global_memory_path = data / "global-memory.json"
         self.worker = WorkerClient(self.runtime_root, root)
+        self.ocr_worker = WorkerClient(self.runtime_root, root, name="ocr-worker")
         atexit.register(self.worker.shutdown)
+        atexit.register(self.ocr_worker.shutdown)
+        self.ocr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr-worker")
+        atexit.register(self.ocr_executor.shutdown, wait=False, cancel_futures=True)
         self.llm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-worker")
         atexit.register(self.llm_executor.shutdown, wait=False, cancel_futures=True)
         self.api_key = ""
@@ -357,6 +362,8 @@ class RuntimeServices:
         self.install_lock = threading.Lock()
         self.frame_times: dict[str, float] = {}
         self.latest_images: dict[str, str] = {}
+        self.latest_ocr: dict[str, dict[str, Any]] = {}
+        self.ocr_pending: set[str] = set()
         self.latest_states: dict[str, dict[str, Any]] = {}
         self.vision_llm_times: dict[str, float] = {}
         self.offline_parser = OfflineIntentParser()
@@ -1519,6 +1526,51 @@ class RuntimeServices:
         self.audit(project_id, "assistant_proposal_confirmed", {"proposalId": proposal_id, "action": selected["action"]})
         return {"ok": True, "proposal": selected, "directive": {"action": selected["action"], "payload": payload, "result": result}}
 
+    def schedule_ocr(
+        self,
+        project_id: str,
+        image_b64: str,
+        languages: list[str],
+        reward_config: dict[str, Any],
+    ) -> None:
+        with self.lock:
+            if project_id in self.ocr_pending:
+                return
+            self.ocr_pending.add(project_id)
+
+        def run() -> None:
+            try:
+                result = self.ocr_worker.call(
+                    "ocr",
+                    {"imageBase64": image_b64, "languages": languages, "rewardConfig": reward_config},
+                )
+                parsed = {
+                    key: result.get(key)
+                    for key in (
+                        "ocrTexts", "screenType", "rank", "speed", "progress", "itemState",
+                        "crashed", "fallingBehind", "failed", "learningScore",
+                    )
+                    if key in result
+                }
+                parsed["ocrConfidence"] = float(result.get("confidence") or 0)
+                parsed["ocrMessage"] = str(result.get("message", "OCR 已完成。"))
+                parsed["ocrReady"] = bool(result.get("ready"))
+                with self.lock:
+                    self.latest_ocr[project_id] = parsed
+            except ServiceError as worker_error:
+                with self.lock:
+                    self.latest_ocr[project_id] = {
+                        "ocrTexts": [],
+                        "ocrConfidence": 0.0,
+                        "ocrReady": False,
+                        "ocrMessage": worker_error.message,
+                    }
+            finally:
+                with self.lock:
+                    self.ocr_pending.discard(project_id)
+
+        self.ocr_executor.submit(run)
+
     def save_frame(
         self,
         project_id: str,
@@ -1565,6 +1617,31 @@ class RuntimeServices:
             frame_path = project / "datasets" / "trajectories" / f"{frame_id}.jpg"
             frame_path.write_bytes(raw)
             self.frame_times[project_id] = current_time
+        requested_corners = payload.get("screenCorners")
+        if requested_corners is not None and not isinstance(requested_corners, list):
+            raise ServiceError(400, "螢幕四角資料格式不正確。")
+        try:
+            screen = self.worker.call(
+                "detect_screen",
+                {
+                    "imageBase64": image_b64,
+                    "screenCorners": requested_corners or [],
+                    "screenCornerSource": str(payload.get("screenCornerSource", "manual")),
+                },
+            )
+        except ServiceError as worker_error:
+            screen = {
+                "screenDetected": False,
+                "screenConfidence": 0.0,
+                "screenCorners": [],
+                "cornerSource": "none",
+                "message": worker_error.message,
+                "processedImageBase64": image_b64,
+            }
+        processed_image_b64 = str(screen.pop("processedImageBase64", "") or image_b64)
+        with self.lock:
+            cached_ocr = dict(self.latest_ocr.get(project_id, {}))
+            ocr_pending = project_id in self.ocr_pending
         state: dict[str, Any] = {
             "frameId": frame_id,
             "timestamp": now(),
@@ -1578,13 +1655,16 @@ class RuntimeServices:
             "fallingBehind": False,
             "failed": False,
             "confidence": 0.0,
+            "screenConfidence": 0.0,
+            "ocrConfidence": 0.0,
             "learningScore": None,
             "ready": False,
             "rewardConfig": reward_config,
             "guidanceId": active_guidance.get("id") if active_guidance else None,
             "guidanceVersion": active_guidance.get("version") if active_guidance else None,
             "guidanceActionRules": guidance_action_rules,
-            **self.latest_states.get(project_id, {}),
+            **cached_ocr,
+            **screen,
             "frameId": frame_id,
             "timestamp": now(),
             "rewardConfig": reward_config,
@@ -1593,21 +1673,29 @@ class RuntimeServices:
             "guidanceActionRules": guidance_action_rules,
         }
         if payload.get("runOcr", True):
-            try:
-                state.update(self.worker.call("ocr", {"imageBase64": image_b64, "languages": payload.get("languages") or ["ch_tra", "en"], "rewardConfig": reward_config}))
-            except ServiceError as worker_error:
-                state.update({"ready": False, "confidence": 0.0, "ocrTexts": [], "message": worker_error.message})
+            self.schedule_ocr(
+                project_id,
+                processed_image_b64,
+                list(payload.get("languages") or ["ch_tra", "en"]),
+                reward_config,
+            )
+            ocr_pending = True
         threshold = min(max(float(confidence_threshold), 0.0), 1.0)
         state["confidenceThreshold"] = threshold
-        if float(state.get("confidence") or 0) < threshold:
+        state["confidence"] = float(state.get("screenConfidence") or 0)
+        state["ocrPending"] = ocr_pending
+        if not state.get("screenDetected") or state["confidence"] < threshold:
             state["ready"] = False
-            state["message"] = f"辨識信心不足 {threshold:.2f}，請重新確認鏡頭角度、反光與畫面範圍。"
+            state["message"] = f"尚未可靠偵測到螢幕四角（需要 {threshold:.2f}）。請移動四角控制點或重新自動偵測。"
+        else:
+            state["ready"] = True
+            state["message"] = "已偵測並裁切螢幕四角。" + ("文字辨識正在背景處理。" if ocr_pending else "")
         self.latest_states[project_id] = dict(state)
         if menu_mode:
             engine = {"action": None, "message": "選單畫格已與賽車 PPO 資料隔離。"}
         else:
             try:
-                engine = self.worker.call("engine_frame", {"state": state, "imageBase64": image_b64})
+                engine = self.worker.call("engine_frame", {"state": state, "imageBase64": processed_image_b64})
             except ServiceError as worker_error:
                 engine = {"action": None, "message": worker_error.message}
             append_jsonl(
@@ -1877,7 +1965,13 @@ class RuntimeServices:
 
     def shutdown(self) -> None:
         self.stop_active_engine()
-        self.worker.shutdown()
+        if hasattr(self.ocr_worker, "terminate_process"):
+            self.ocr_worker.terminate_process()
+        self.ocr_executor.shutdown(wait=True, cancel_futures=True)
+        if hasattr(self.worker, "shutdown"):
+            self.worker.shutdown()
+        if hasattr(self.ocr_worker, "shutdown"):
+            self.ocr_worker.shutdown()
         self.llm_executor.shutdown(wait=False, cancel_futures=True)
 
     def worker_health(self, project_id: str = "") -> dict[str, Any]:

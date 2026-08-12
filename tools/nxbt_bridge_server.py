@@ -175,6 +175,22 @@ class BridgeState:
                     raise BridgeError(HTTPStatus.CONFLICT, "NXBT action was cancelled by emergency stop.")
         return {"ok": True, "action": action if self.dry_run else None}
 
+    def apply_test_input(self, payload: dict[str, Any]) -> dict[str, Any]:
+        operation = str(payload.get("operation", "")).strip().lower()
+        action = normalize_action(payload.get("action"))
+        with self.lock:
+            if not self.connected:
+                raise BridgeError(HTTPStatus.CONFLICT, "NXBT controller is not connected.")
+            session = self.session
+            cancel_event = self.action_cancel
+        if session is not None:
+            with self.action_lock:
+                with self.lock:
+                    if not self.connected or self.session is not session or cancel_event.is_set():
+                        raise BridgeError(HTTPStatus.CONFLICT, "NXBT test input was cancelled before execution.")
+                session.apply_test_input(operation, action)
+        return {"ok": True, "operation": operation, "action": action if self.dry_run else None}
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "Switch2NxbtBridge/0.1"
@@ -239,6 +255,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(self.bridge_server.state.disconnect(emergency=True))
             if self.path == "/action":
                 return self.send_json(self.bridge_server.state.apply_action(payload))
+            if self.path == "/test-input":
+                return self.send_json(self.bridge_server.state.apply_test_input(payload))
             raise BridgeError(HTTPStatus.NOT_FOUND, "Bridge route not found.")
         except BridgeError as error:
             self.send_json({"error": error.message}, error.status)

@@ -66,6 +66,9 @@ RUNTIME_KEYS = {
     "cameraConnected",
     "cameraReady",
     "cameraCalibrated",
+    "screenDetected",
+    "screenConfidence",
+    "screenCornerSource",
     "cameraStream",
     "serialPort",
     "connectionOk",
@@ -84,8 +87,10 @@ NXBT_TEST_BUTTONS = {
 NXBT_TEST_STICK_DIRECTIONS = {
     "left": (-100, 0),
     "right": (100, 0),
-    "up": (0, -100),
-    "down": (0, 100),
+    # NXBT's Python API uses positive Y for up. Browser pointer/gamepad Y is
+    # converted separately by the bridge's continuous-input path.
+    "up": (0, 100),
+    "down": (0, -100),
 }
 
 
@@ -1165,11 +1170,27 @@ class Store:
                 raise ApiError(HTTPStatus.CONFLICT, "NXBT 測試只能在訓練與正式遊玩都停止時執行。")
             if not runtime.get("controllerReady"):
                 raise ApiError(HTTPStatus.CONFLICT, "NXBT 控制器尚未連線，不能測試輸入。")
+            if not runtime.get("emergencyStopVerified"):
+                raise ApiError(HTTPStatus.CONFLICT, "請先完成軟體急停測試，才可送出 NXBT 測試動作。")
         with self.lock:
             connector = self.nxbt_connectors.get(project_id)
         if not connector:
             raise ApiError(HTTPStatus.CONFLICT, "NXBT 尚未連線，不能測試輸入。")
-        result = self.nxbt_request(connector, "/action", normalized, timeout=5)
+        if operation == "neutral":
+            result = self.nxbt_request(connector, "/action", normalized, timeout=5)
+        else:
+            try:
+                result = self.nxbt_request(
+                    connector,
+                    "/test-input",
+                    {"operation": operation, "action": normalized},
+                    timeout=5,
+                )
+            except ApiError as bridge_error:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "NXBT bridge 尚未支援可靠按鍵測試。請把最新版 tools/nxbt_bridge.py 與 tools/nxbt_bridge_server.py 複製到 VM，重新啟動 bridge 後再測試。",
+                ) from bridge_error
         if not result.get("ok"):
             raise ApiError(HTTPStatus.CONFLICT, "NXBT VM bridge 沒有確認測試動作，請檢查 bridge 與控制器連線。")
         with self.lock:
@@ -1193,7 +1214,17 @@ class Store:
 
     def action_nxbt(self, project_id: str, payload: dict[str, Any], manual_demonstration: bool = False, menu_action: bool = False) -> dict[str, Any]:
         self.require_project(project_id)
-        normalized, neutral = self.normalize_nxbt_action(project_id, payload, menu_action=menu_action)
+        payload = dict(payload) if isinstance(payload, dict) else payload
+        manual_control = bool(payload.pop("manualControl", False)) if isinstance(payload, dict) else False
+        normalized, neutral = self.normalize_nxbt_action(
+            project_id,
+            payload,
+            menu_action=menu_action,
+            test_action=manual_control,
+        )
+        backend = self.get_project_settings(project_id)["effective"]["output"].get("backend")
+        if not neutral and backend not in {"nxbt_bluetooth", "hybrid"}:
+            raise ApiError(HTTPStatus.CONFLICT, "目前控制輸出不是 NXBT 或混合模式。")
         runtime = self.runtime_status(project_id)
         runtime_blocked = (
             runtime["paused"]
@@ -1205,21 +1236,48 @@ class Store:
             not runtime["engineReady"] or runtime["mode"] not in {"training", "live", "canary"}
         )
         demonstration_blocked = (manual_demonstration or menu_action) and runtime["mode"] != "idle"
+        manual_blocked = manual_control and (
+            runtime["mode"] != "idle"
+            or runtime["paused"]
+            or not runtime["controllerReady"]
+            or not runtime["emergencyStopVerified"]
+        )
+        if manual_control:
+            runtime_blocked = False
+            engine_blocked = False
         if menu_action:
             engine_blocked = False
+        if not neutral and manual_blocked:
+            raise ApiError(HTTPStatus.CONFLICT, "人工控制已阻止：只能在訓練停止、控制器連線且軟體急停已驗證時使用。")
         if not neutral and (runtime_blocked or engine_blocked or demonstration_blocked):
             raise ApiError(HTTPStatus.CONFLICT, "NXBT 動作已阻止：引擎、鏡頭辨識、控制器或軟體急停驗證尚未完成。")
         with self.lock:
             connector = self.nxbt_connectors.get(project_id)
         if not connector:
             raise ApiError(HTTPStatus.CONFLICT, "NXBT 尚未連線，不能送出控制命令。")
-        result = self.nxbt_request(connector, "/action", normalized, timeout=5)
+        active_buttons = [key for key, pressed in normalized["buttons"].items() if pressed]
+        has_stick_input = any(normalized["sticks"].values())
+        if manual_control and len(active_buttons) == 1 and not has_stick_input:
+            try:
+                result = self.nxbt_request(
+                    connector,
+                    "/test-input",
+                    {"operation": active_buttons[0], "action": normalized},
+                    timeout=5,
+                )
+            except ApiError as bridge_error:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "NXBT bridge 尚未支援可靠人工按鍵。請把最新版 tools/nxbt_bridge.py 與 tools/nxbt_bridge_server.py 複製到 VM 並重新啟動。",
+                ) from bridge_error
+        else:
+            result = self.nxbt_request(connector, "/action", normalized, timeout=5)
         if self.get_project_settings(project_id)["effective"]["logging"].get("actions", True):
             append_jsonl(
                 self.require_project(project_id) / "logs" / f"actions-{datetime.now().strftime('%Y-%m-%d')}.jsonl",
                 {
                     "timestamp": utc_now(),
-                    "action": "nxbt_menu_action" if menu_action else "nxbt_demonstration_action" if manual_demonstration else "nxbt_action",
+                    "action": "nxbt_manual_action" if manual_control else "nxbt_menu_action" if menu_action else "nxbt_demonstration_action" if manual_demonstration else "nxbt_action",
                     "backend": "nxbt_bluetooth",
                     "result": "sent",
                     "details": normalized,
@@ -1328,7 +1386,8 @@ class Store:
         runtime = self.runtime_status(project_id)
         ready = bool(status.get("ready"))
         runtime["engineReady"] = ready
-        runtime["visionReady"] = bool(status.get("ocr", runtime.get("visionReady")))
+        if "visionReady" in status:
+            runtime["visionReady"] = bool(status["visionReady"])
         runtime["modelReady"] = bool(status.get("stableReady") or status.get("modelSaved") or runtime.get("modelReady"))
         if status.get("mode") in {"idle", "training", "live", "canary", "error"}:
             runtime["mode"] = status["mode"]
@@ -1674,6 +1733,10 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json(STORE.action_nxbt(parts[2], self.read_json_body()))
                 if action == "demonstration-action":
                     return self.send_json(STORE.action_nxbt(parts[2], self.read_json_body(), manual_demonstration=True))
+                if action == "manual-action":
+                    payload = self.read_json_body()
+                    payload["manualControl"] = True
+                    return self.send_json(STORE.action_nxbt(parts[2], payload))
                 if action == "menu-action":
                     return self.send_json(STORE.action_nxbt(parts[2], self.read_json_body(), menu_action=True))
                 if action == "test-input":

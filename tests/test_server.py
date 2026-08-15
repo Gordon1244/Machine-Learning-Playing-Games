@@ -600,7 +600,14 @@ class ApiTest(StoreTest):
         self.store.services.ocr_worker = fake_worker
         self.store.services.latest_ocr[project_id] = {"rank": 1, "ocrConfidence": 0.9, "ocrReady": True}
         jpeg = base64.b64encode(b"\xff\xd8\xff\xe0api-test").decode("ascii")
-        _, frame = self.request("POST", f"/api/projects/{project_id}/vision/frame", {"imageBase64": jpeg})
+        frame = None
+        for _index in range(3):
+            _, frame = self.request(
+                "POST",
+                f"/api/projects/{project_id}/vision/frame",
+                {"imageBase64": jpeg, "cameraSessionId": "api-camera-session"},
+            )
+        self.assertIsNotNone(frame)
         self.assertEqual(frame["state"]["rank"], 1)
         self.assertTrue(frame["state"]["ready"])
         _, cleared = self.request("DELETE", f"/api/projects/{project_id}/assistant/chat", {})

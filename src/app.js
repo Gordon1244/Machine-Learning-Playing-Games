@@ -36,11 +36,17 @@ const state = {
   cameraStream: null,
   cameraStreams: new Set(),
   cameraRequestId: 0,
+  cameraVerificationId: "",
   cameraOpening: false,
   cameraLastError: "",
   cameraDeviceLabel: "",
   screenDetected: false,
+  screenCandidatePassed: false,
   screenConfidence: 0,
+  screenEvidence: null,
+  screenVerificationFrames: 0,
+  screenVerificationRequired: 3,
+  screenDetectionMessage: "",
   screenCorners: [
     { x: 0.06, y: 0.08 },
     { x: 0.94, y: 0.08 },
@@ -352,19 +358,18 @@ function renderCameraCalibration() {
   const previewStatus = state.cameraReady ? "已顯示" : "未顯示";
   const calibrationStatus = state.cameraCalibrated ? "已確認" : "未確認";
   const screenStatus = state.screenDetected ? "已框住" : state.cameraReady ? "偵測中" : "等待鏡頭";
-  const screenNote = state.screenDetected
-    ? `${state.screenCornersManual ? "使用手動四角" : "已鎖定自動偵測四角"}，信心 ${Math.round(state.screenConfidence * 100)}%`
-    : "偵測不到時，可直接拖曳四個角到螢幕邊緣";
+  const screenNote = getScreenDetectionNote();
+  const showScreenCorners = shouldShowScreenCorners();
   return `
     <p class="step-copy">把攝影機對準 Switch 2 螢幕或掌機畫面。系統必須真的取得鏡頭畫面後，才允許你確認校正。${helpIcon("cameraCalibration", "鏡頭校正說明")}</p>
     ${window.isSecureContext ? "" : `<div class="alert">目前不是安全的瀏覽器環境，鏡頭預覽可能無法播放。請改用 <strong>http://localhost:8765</strong> 開啟。</div>`}
     <div class="alert" id="cameraDiagnostic" ${state.cameraLastError ? "" : "hidden"}><strong>鏡頭診斷：</strong><span id="cameraDiagnosticMessage">${escapeHtml(state.cameraLastError)}</span></div>
     <div class="camera-preview" id="cameraPreviewFrame">
       <video id="cameraPreview" autoplay playsinline muted></video>
-      <svg class="screen-corner-overlay" id="screenCornerOverlay" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+      <svg class="screen-corner-overlay" id="screenCornerOverlay" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true" ${showScreenCorners ? "" : "hidden"}>
         <polygon id="screenCornerPolygon" points=""></polygon>
       </svg>
-      ${state.screenCorners.map((corner, index) => `<button class="screen-corner-handle" type="button" data-screen-corner="${index}" aria-label="移動螢幕${["左上", "右上", "右下", "左下"][index]}角" style="--corner-x:${corner.x};--corner-y:${corner.y}"><span>${index + 1}</span></button>`).join("")}
+      ${state.screenCorners.map((corner, index) => `<button class="screen-corner-handle" type="button" data-screen-corner="${index}" aria-label="移動螢幕${["左上", "右上", "右下", "左下"][index]}角" style="--corner-x:${corner.x};--corner-y:${corner.y}" ${showScreenCorners ? "" : "hidden"}><span>${index + 1}</span></button>`).join("")}
       <div class="camera-empty" ${state.cameraReady ? "hidden" : ""}>尚未顯示鏡頭畫面</div>
     </div>
     <div class="metric-grid">
@@ -377,6 +382,7 @@ function renderCameraCalibration() {
       <button class="secondary-button" id="cameraOpenButton" data-action="open-camera" type="button" ${state.cameraOpening ? "disabled" : ""}>${state.cameraOpening ? "正在開啟..." : "開啟鏡頭"}</button>
       <button class="secondary-button" id="cameraCloseButton" data-action="close-camera" type="button" ${state.cameraConnected || state.cameraOpening ? "" : "disabled"}>關閉鏡頭</button>
       <button class="secondary-button" id="screenAutoDetectButton" data-action="redetect-screen" type="button" ${state.cameraReady ? "" : "disabled"}>重新自動偵測四角</button>
+      <button class="secondary-button" data-action="manual-screen-corners" type="button" ${state.cameraReady ? "" : "disabled"}>手動設定四角</button>
       <button class="primary-button" id="cameraConfirmButton" data-action="complete-step" type="button" ${state.cameraReady && state.screenDetected ? "" : "disabled"}>我確認四角正確</button>
       <button class="secondary-button" data-action="camera-tip" type="button">我看不到畫面</button>
     </div>
@@ -706,12 +712,26 @@ async function handleAction(action) {
 
   if (action === "redetect-screen") {
     state.screenCornersManual = false;
-    state.screenDetected = false;
-    state.screenConfidence = 0;
-    state.screenCornerSource = "none";
+    state.cameraVerificationId = newCameraVerificationId();
+    clearScreenVerification("正在重新搜尋完整螢幕外框。");
     updateScreenCornerOverlay();
     showToast("正在重新偵測螢幕四角；請保持鏡頭穩定。偵測不到時可拖曳四個角。 ");
     await window.ProjectUI?.requestVisionCapture();
+  }
+
+  if (action === "manual-screen-corners") {
+    state.screenCorners = [
+      { x: 0.06, y: 0.08 }, { x: 0.94, y: 0.08 },
+      { x: 0.94, y: 0.92 }, { x: 0.06, y: 0.92 }
+    ];
+    state.screenCornersManual = true;
+    state.cameraVerificationId = newCameraVerificationId();
+    clearScreenVerification("手動四角只是候選範圍，仍需檢查真實外框、框內內容與連續三張穩定畫面。");
+    state.screenCornerSource = "manual";
+    updateScreenCornerOverlay();
+    showToast("已顯示手動控制點；請把四個角移到真正螢幕外框，這不代表已通過驗證。");
+    await window.ProjectUI?.requestVisionCapture();
+    return;
   }
 
   if (action === "start-training") {
@@ -835,13 +855,12 @@ async function openCamera() {
   }
 
   const requestId = ++state.cameraRequestId;
+  state.cameraVerificationId = newCameraVerificationId();
   state.cameraOpening = true;
   stopAllCameraStreams();
   state.cameraReady = false;
   state.cameraCalibrated = false;
-  state.screenDetected = false;
-  state.screenConfidence = 0;
-  state.screenCornerSource = "none";
+  clearScreenVerification();
   state.cameraLastError = "";
   state.cameraDeviceLabel = "";
   refreshCameraCalibrationView();
@@ -964,14 +983,13 @@ function refreshCameraCalibrationView() {
 function closeCamera({ broadcast = true, silent = false } = {}) {
   if (state.engineMode !== "idle") window.ProjectUI?.sendControl("pause");
   state.cameraRequestId += 1;
+  state.cameraVerificationId = "";
   state.cameraOpening = false;
   const stoppedTracks = stopAllCameraStreams();
   state.cameraConnected = false;
   state.cameraReady = false;
   state.cameraCalibrated = false;
-  state.screenDetected = false;
-  state.screenConfidence = 0;
-  state.screenCornerSource = "none";
+  clearScreenVerification();
   state.cameraLastError = "";
   state.cameraDeviceLabel = "";
   if (broadcast) broadcastStopCamera();
@@ -986,12 +1004,11 @@ function closeCamera({ broadcast = true, silent = false } = {}) {
 function handleCameraTrackEnded(stream) {
   if (stream !== state.cameraStream) return;
   stopAllCameraStreams();
+  state.cameraVerificationId = "";
   state.cameraConnected = false;
   state.cameraReady = false;
   state.cameraCalibrated = false;
-  state.screenDetected = false;
-  state.screenConfidence = 0;
-  state.screenCornerSource = "none";
+  clearScreenVerification();
   state.cameraLastError = "鏡頭串流被瀏覽器或作業系統中斷。請確認沒有其他分頁或程式搶用攝影機，再重新開啟。";
   if (state.engineMode !== "idle") window.ProjectUI?.sendControl("pause");
   window.ProjectUI?.stopVisionCapture();
@@ -1040,10 +1057,49 @@ function validScreenCorners(value) {
     && value.every((point) => Number.isFinite(Number(point?.x)) && Number.isFinite(Number(point?.y)));
 }
 
+function newCameraVerificationId() {
+  return window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function clearScreenVerification(message = "") {
+  state.screenDetected = false;
+  state.screenCandidatePassed = false;
+  state.screenConfidence = 0;
+  state.screenEvidence = null;
+  state.screenVerificationFrames = 0;
+  state.screenVerificationRequired = 3;
+  state.screenDetectionMessage = message;
+  state.screenCornerSource = "none";
+}
+
+function getScreenDetectionNote() {
+  if (state.screenDetected) {
+    return `${state.screenCornersManual ? "手動四角已驗證" : "自動四角已驗證"}，信心 ${Math.round(state.screenConfidence * 100)}%，4 條邊與框內內容已檢查`;
+  }
+  if (!state.cameraReady) return "開啟鏡頭後才會精準檢查四條邊與框內內容";
+  if (state.screenVerificationFrames > 0) {
+    return `單張畫面已通過，正在確認位置穩定 ${state.screenVerificationFrames}/${state.screenVerificationRequired}；請保持鏡頭不動`;
+  }
+  const supportedEdges = Number(state.screenEvidence?.supportedEdges);
+  if (Number.isFinite(supportedEdges)) {
+    const content = state.screenEvidence?.contentPassed ? "框內內容正常" : "框內內容不足或被遮住";
+    return `目前只有 ${supportedEdges}/4 條邊貼合，${content}。四個角必須落在真正螢幕外框`;
+  }
+  return state.screenDetectionMessage || "正在搜尋完整螢幕外框；偵測不到時可拖曳四個角協助定位";
+}
+
+function shouldShowScreenCorners() {
+  return state.cameraReady && (state.screenCornersManual || state.screenCornerSource !== "none");
+}
+
 function updateScreenCornerOverlay() {
   const overlay = document.querySelector("#screenCornerOverlay");
   const polygon = document.querySelector("#screenCornerPolygon");
-  if (overlay) overlay.classList.toggle("verified", state.screenDetected);
+  const showScreenCorners = shouldShowScreenCorners();
+  if (overlay) {
+    overlay.toggleAttribute("hidden", !showScreenCorners);
+    overlay.classList.toggle("verified", state.screenDetected);
+  }
   if (polygon && validScreenCorners(state.screenCorners)) {
     polygon.setAttribute("points", state.screenCorners.map((point) => `${Number(point.x) * 100},${Number(point.y) * 100}`).join(" "));
   }
@@ -1052,14 +1108,13 @@ function updateScreenCornerOverlay() {
     if (!corner) return;
     handle.style.setProperty("--corner-x", String(corner.x));
     handle.style.setProperty("--corner-y", String(corner.y));
+    handle.hidden = !showScreenCorners;
     handle.disabled = !state.cameraReady;
   });
   const status = document.querySelector("#screenDetectionStatus");
   if (status) status.textContent = state.screenDetected ? "已框住" : state.cameraReady ? "等待驗證" : "等待鏡頭";
   const note = document.querySelector("#screenDetectionNote");
-  if (note) note.textContent = state.screenDetected
-    ? `${state.screenCornersManual ? "使用手動四角" : "已鎖定自動偵測四角"}，信心 ${Math.round(state.screenConfidence * 100)}%`
-    : state.cameraReady ? "可拖曳四個角到螢幕邊緣，放開後會立即驗證" : "開啟鏡頭後才會偵測";
+  if (note) note.textContent = getScreenDetectionNote();
 }
 
 function bindScreenCornerControls() {
@@ -1070,6 +1125,7 @@ function bindScreenCornerControls() {
       if (!state.cameraReady) return;
       event.preventDefault();
       const index = Number(handle.dataset.screenCorner);
+      state.cameraVerificationId = newCameraVerificationId();
       handle.setPointerCapture(event.pointerId);
       const move = (pointerEvent) => {
         const box = frame.getBoundingClientRect();
@@ -1080,7 +1136,11 @@ function bindScreenCornerControls() {
         };
         state.screenCornersManual = true;
         state.screenDetected = false;
+        state.screenCandidatePassed = false;
         state.screenConfidence = 0;
+        state.screenEvidence = null;
+        state.screenVerificationFrames = 0;
+        state.screenDetectionMessage = "四角已移動，正在重新檢查真實邊界與框內內容。";
         state.cameraCalibrated = false;
         updateScreenCornerOverlay();
       };
@@ -1354,6 +1414,11 @@ function setLatestGameState(gameState = {}) {
   }
   if (gameState.cornerSource) state.screenCornerSource = String(gameState.cornerSource);
   if (gameState.screenConfidence !== undefined) state.screenConfidence = Number(gameState.screenConfidence) || 0;
+  if (gameState.screenEvidence && typeof gameState.screenEvidence === "object") state.screenEvidence = gameState.screenEvidence;
+  if (gameState.rawScreenDetected !== undefined) state.screenCandidatePassed = Boolean(gameState.rawScreenDetected);
+  if (gameState.verificationFrames !== undefined) state.screenVerificationFrames = Number(gameState.verificationFrames) || 0;
+  if (gameState.verificationRequired !== undefined) state.screenVerificationRequired = Number(gameState.verificationRequired) || 3;
+  if (typeof gameState.message === "string") state.screenDetectionMessage = gameState.message;
   if (gameState.ready !== undefined) {
     state.screenDetected = Boolean(gameState.ready);
     state.needsRecalibration = !state.screenDetected;
@@ -1479,6 +1544,7 @@ function getPersistentState(saveReason = "autosave") {
 
 async function loadPersistentState(projectId, saved = {}) {
   state.cameraRequestId += 1;
+  state.cameraVerificationId = "";
   state.cameraOpening = false;
   stopAllCameraStreams();
   await closeSerialPort();
@@ -1486,9 +1552,7 @@ async function loadPersistentState(projectId, saved = {}) {
   state.cameraConnected = false;
   state.cameraReady = false;
   state.cameraCalibrated = false;
-  state.screenDetected = false;
-  state.screenConfidence = 0;
-  state.screenCornerSource = "none";
+  clearScreenVerification();
   state.cameraLastError = "";
   state.cameraDeviceLabel = "";
   state.connectionOk = false;

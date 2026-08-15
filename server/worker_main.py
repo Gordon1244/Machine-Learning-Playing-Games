@@ -8,6 +8,7 @@ stay here so a broken ML dependency cannot take down the project server.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import re
 import shutil
@@ -154,13 +155,139 @@ def screen_angle_quality(points: Any) -> float:
     return sum(qualities) / len(qualities)
 
 
+def screen_evidence(image: Any, points: Any, edges: Any, edge_distance: Any = None) -> dict[str, Any]:
+    import cv2
+    import numpy as np
+
+    height, width = image.shape[:2]
+    image_area = float(width * height)
+    area_ratio = abs(float(cv2.contourArea(points))) / image_area
+    angle_quality = screen_angle_quality(points)
+    top_width = float(np.linalg.norm(points[1] - points[0]))
+    bottom_width = float(np.linalg.norm(points[2] - points[3]))
+    left_height = float(np.linalg.norm(points[3] - points[0]))
+    right_height = float(np.linalg.norm(points[2] - points[1]))
+    target_width = max(64, int(round(max(top_width, bottom_width))))
+    target_height = max(36, int(round(max(left_height, right_height))))
+    aspect_ratio = target_width / max(1, target_height)
+    margin_pixels = min(
+        float(points[:, 0].min()),
+        float(points[:, 1].min()),
+        float(width - 1 - points[:, 0].max()),
+        float(height - 1 - points[:, 1].max()),
+    )
+    margin_ratio = margin_pixels / max(1.0, float(min(width, height)))
+
+    distance = edge_distance if edge_distance is not None else cv2.distanceTransform(255 - edges, cv2.DIST_L2, 3)
+    edge_tolerance = max(3.0, min(width, height) * 0.01)
+    edge_support: list[float] = []
+    for index in range(4):
+        samples = np.linspace(points[index], points[(index + 1) % 4], 160)
+        xs = np.clip(np.rint(samples[:, 0]).astype(int), 0, width - 1)
+        ys = np.clip(np.rint(samples[:, 1]).astype(int), 0, height - 1)
+        edge_support.append(float(np.mean(distance[ys, xs] <= edge_tolerance)))
+    mean_edge_support = float(np.mean(edge_support))
+    supported_edges = sum(value >= 0.30 for value in edge_support)
+
+    scale = min(1.0, 1280 / target_width, 720 / target_height)
+    target_width = max(64, int(round(target_width * scale)))
+    target_height = max(36, int(round(target_height * scale)))
+    destination = np.asarray(
+        [[0, 0], [target_width - 1, 0], [target_width - 1, target_height - 1], [0, target_height - 1]],
+        dtype=np.float32,
+    )
+    transform = cv2.getPerspectiveTransform(points, destination)
+    cropped = cv2.warpPerspective(image, transform, (target_width, target_height))
+    cropped_gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+    contrast = float(np.std(cropped_gray))
+    histogram = cv2.calcHist([cropped_gray], [0], None, [64], [0, 256]).reshape(-1)
+    probabilities = histogram[histogram > 0] / max(1.0, float(histogram.sum()))
+    entropy = float(-np.sum(probabilities * np.log2(probabilities))) if probabilities.size else 0.0
+    detail_density = float(np.mean(cv2.Canny(cropped_gray, 50, 150) > 0))
+
+    geometry_passed = (
+        area_ratio >= 0.08
+        and 1.10 <= aspect_ratio <= 2.60
+        and angle_quality >= 0.30
+        and margin_ratio >= 0.002
+    )
+    boundary_passed = supported_edges >= 3 and mean_edge_support >= 0.30
+    content_passed = contrast >= 15.0 and entropy >= 2.2 and detail_density >= 0.008
+    area_score = min(1.0, max(0.0, (area_ratio - 0.05) / 0.35))
+    edge_score = min(1.0, mean_edge_support / 0.55) * 0.7 + (supported_edges / 4) * 0.3
+    content_score = (
+        min(1.0, max(0.0, (contrast - 8.0) / 32.0))
+        + min(1.0, max(0.0, (entropy - 1.5) / 3.0))
+        + min(1.0, detail_density / 0.04)
+    ) / 3
+    confidence = 0.15 * angle_quality + 0.30 * area_score + 0.35 * edge_score + 0.20 * content_score
+    detected = geometry_passed and boundary_passed and content_passed
+    if not detected:
+        confidence = min(confidence, 0.69)
+    return {
+        "detected": detected,
+        "confidence": round(float(min(0.99, max(0.0, confidence))), 4),
+        "areaRatio": round(area_ratio, 4),
+        "angleQuality": round(angle_quality, 4),
+        "aspectRatio": round(aspect_ratio, 4),
+        "marginRatio": round(margin_ratio, 4),
+        "edgeSupport": [round(value, 4) for value in edge_support],
+        "meanEdgeSupport": round(mean_edge_support, 4),
+        "supportedEdges": supported_edges,
+        "contentContrast": round(contrast, 3),
+        "contentEntropy": round(entropy, 3),
+        "detailDensity": round(detail_density, 4),
+        "geometryPassed": geometry_passed,
+        "boundaryPassed": boundary_passed,
+        "contentPassed": content_passed,
+        "cropped": cropped,
+        "processedWidth": target_width,
+        "processedHeight": target_height,
+    }
+
+
+def automatic_screen_candidates(edges: Any, width: int, height: int) -> list[Any]:
+    import cv2
+    import numpy as np
+
+    candidates: list[Any] = []
+    seen: set[tuple[int, ...]] = set()
+    for horizontal, vertical in ((15, 15), (31, 15), (41, 21)):
+        joined = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((3, horizontal), np.uint8), iterations=1)
+        joined = cv2.morphologyEx(joined, cv2.MORPH_CLOSE, np.ones((vertical, 3), np.uint8), iterations=1)
+        joined = cv2.dilate(joined, np.ones((5, 5), np.uint8), iterations=1)
+        contours, _hierarchy = cv2.findContours(joined, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:40]:
+            if cv2.contourArea(contour) / float(width * height) < 0.04:
+                continue
+            hull = cv2.convexHull(contour)
+            perimeter = cv2.arcLength(hull, True)
+            for epsilon in (0.015, 0.025, 0.04, 0.06):
+                polygon = cv2.approxPolyDP(hull, epsilon * perimeter, True)
+                if len(polygon) != 4 or not cv2.isContourConvex(polygon):
+                    continue
+                ordered = ordered_screen_corners(
+                    [{"x": float(item[0][0]) / width, "y": float(item[0][1]) / height} for item in polygon],
+                    width,
+                    height,
+                )
+                if ordered is None:
+                    continue
+                key = tuple(int(round(value / 12)) for point in ordered for value in point)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(ordered)
+                break
+    candidates.sort(key=lambda points: abs(float(cv2.contourArea(points))), reverse=True)
+    return candidates[:16]
+
+
 def detect_screen(
     image_b64: str,
     requested_corners: Any = None,
     requested_source: str = "manual",
 ) -> dict[str, Any]:
-    status = modules()
-    if not status["opencv"] or not status["numpy"]:
+    if not available("cv2") or not available("numpy"):
         return {
             "screenDetected": False,
             "screenConfidence": 0.0,
@@ -179,84 +306,70 @@ def detect_screen(
     height, width = image.shape[:2]
     points = ordered_screen_corners(requested_corners, width, height)
     source = "locked_auto" if points is not None and requested_source == "locked_auto" else "manual" if points is not None else "auto"
-    area_ratio = 0.0
-    angle_quality = 0.0
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    median = float(np.median(blurred))
+    lower = int(max(20, 0.55 * median))
+    upper = int(min(255, max(lower + 40, 1.45 * median)))
+    edges = cv2.Canny(blurred, lower, upper)
+    edge_distance = cv2.distanceTransform(255 - edges, cv2.DIST_L2, 3)
 
-    if points is None:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        median = float(np.median(blurred))
-        lower = int(max(20, 0.55 * median))
-        upper = int(min(255, max(lower + 40, 1.45 * median)))
-        edges = cv2.Canny(blurred, lower, upper)
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=2)
-        contours, _hierarchy = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        best: tuple[float, Any, float, float] | None = None
-        image_area = float(width * height)
-        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:30]:
-            contour_area = float(cv2.contourArea(contour))
-            ratio = contour_area / image_area
-            if ratio < 0.08 or ratio > 0.98:
-                continue
-            perimeter = cv2.arcLength(contour, True)
-            polygon = cv2.approxPolyDP(contour, 0.025 * perimeter, True)
-            if len(polygon) != 4 or not cv2.isContourConvex(polygon):
-                continue
-            candidate = ordered_screen_corners(
-                [{"x": float(item[0][0]) / width, "y": float(item[0][1]) / height} for item in polygon],
-                width,
-                height,
-            )
-            if candidate is None:
-                continue
-            quality = screen_angle_quality(candidate)
-            score_value = 0.45 + 0.30 * quality + 0.25 * min(1.0, ratio / 0.55)
-            if best is None or score_value > best[0]:
-                best = (score_value, candidate, ratio, quality)
-        if best is not None:
-            _score, points, area_ratio, angle_quality = best
+    evaluated: list[tuple[Any, dict[str, Any]]] = []
+    if points is not None:
+        evaluated.append((points, screen_evidence(image, points, edges, edge_distance)))
     else:
-        area_ratio = abs(float(cv2.contourArea(points))) / float(width * height)
-        angle_quality = screen_angle_quality(points)
+        for candidate in automatic_screen_candidates(edges, width, height):
+            evaluated.append((candidate, screen_evidence(image, candidate, edges, edge_distance)))
+    if evaluated:
+        points, evidence = max(
+            evaluated,
+            key=lambda item: (bool(item[1]["detected"]), float(item[1]["confidence"])),
+        )
+    else:
+        evidence = None
 
-    convex = bool(points is not None and cv2.isContourConvex(points.reshape((-1, 1, 2)).astype(np.float32)))
-    if points is None or area_ratio < 0.05 or not convex or angle_quality < 0.25:
+    if points is None or evidence is None:
         return {
             "screenDetected": False,
             "screenConfidence": 0.0,
             "screenCorners": [],
             "cornerSource": "none",
             "processedImageBase64": image_b64,
-            "message": "尚未找到可信任的螢幕四角；四個角不可交叉或過度擠在一起。",
+            "message": "尚未找到完整的四邊形螢幕候選；請讓螢幕四角與外框全部入鏡。",
         }
 
-    top_width = np.linalg.norm(points[1] - points[0])
-    bottom_width = np.linalg.norm(points[2] - points[3])
-    left_height = np.linalg.norm(points[3] - points[0])
-    right_height = np.linalg.norm(points[2] - points[1])
-    target_width = max(64, int(round(max(top_width, bottom_width))))
-    target_height = max(36, int(round(max(left_height, right_height))))
-    scale = min(1.0, 1280 / target_width, 720 / target_height)
-    target_width = max(64, int(round(target_width * scale)))
-    target_height = max(36, int(round(target_height * scale)))
-    destination = np.asarray(
-        [[0, 0], [target_width - 1, 0], [target_width - 1, target_height - 1], [0, target_height - 1]],
-        dtype=np.float32,
-    )
-    transform = cv2.getPerspectiveTransform(points, destination)
-    cropped = cv2.warpPerspective(image, transform, (target_width, target_height))
-    ok, encoded = cv2.imencode(".jpg", cropped, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    diagnostic = {
+        key: value for key, value in evidence.items()
+        if key not in {"cropped", "detected", "confidence"}
+    }
+    if not evidence["detected"]:
+        issues = []
+        if not evidence["geometryPassed"]:
+            issues.append("四角形狀、範圍或長寬比不像完整螢幕")
+        if not evidence["boundaryPassed"]:
+            issues.append(f"只有 {evidence['supportedEdges']}/4 條邊貼合真實影像邊界")
+        if not evidence["contentPassed"]:
+            issues.append("框內沒有足夠可辨識的畫面內容")
+        return {
+            "screenDetected": False,
+            "screenConfidence": evidence["confidence"],
+            "screenCorners": normalized_screen_corners(points, width, height),
+            "cornerSource": source,
+            "screenEvidence": diagnostic,
+            "processedImageBase64": image_b64,
+            "message": "；".join(issues) + "。請把四個角精準移到螢幕外框。",
+        }
+
+    ok, encoded = cv2.imencode(".jpg", evidence["cropped"], [int(cv2.IMWRITE_JPEG_QUALITY), 88])
     processed = base64.b64encode(encoded.tobytes()).decode("ascii") if ok else image_b64
-    confidence = min(0.99, 0.50 + 0.25 * angle_quality + 0.25 * min(1.0, area_ratio / 0.55))
-    if source in {"manual", "locked_auto"}:
-        confidence = max(confidence, 0.96)
     return {
         "screenDetected": True,
-        "screenConfidence": round(confidence, 4),
+        "screenConfidence": evidence["confidence"],
         "screenCorners": normalized_screen_corners(points, width, height),
         "cornerSource": source,
-        "processedWidth": target_width,
-        "processedHeight": target_height,
+        "screenEvidence": diagnostic,
+        "processedWidth": evidence["processedWidth"],
+        "processedHeight": evidence["processedHeight"],
         "processedImageBase64": processed,
         "message": (
             "已偵測螢幕四角。"
@@ -274,28 +387,34 @@ class OcrEngine:
         self.languages: tuple[str, ...] = ()
 
     def read(self, image_b64: str, languages: list[str], reward_config: dict[str, Any] | None = None) -> dict[str, Any]:
-        status = modules()
-        if not status["opencv"] or not status["easyocr"] or not status["numpy"]:
+        if not available("cv2") or not available("easyocr") or not available("numpy"):
             return {
                 "ready": False,
                 "message": "OCR 套件尚未安裝。請到進階功能的一鍵安裝準備 opencv、easyocr 與 numpy。",
                 **parse_ocr([]),
             }
         import cv2
-        import easyocr
         import numpy as np
+
+        # EasyOCR and its model downloader can print progress text to stdout.
+        # stdout is reserved for this worker's JSON-lines protocol.
+        with contextlib.redirect_stdout(sys.stderr):
+            import easyocr
 
         selected = tuple(languages or ["ch_tra", "en"])
         if self.reader is None or selected != self.languages:
-            self.reader = easyocr.Reader(list(selected), gpu=False)
+            with contextlib.redirect_stdout(sys.stderr):
+                self.reader = easyocr.Reader(list(selected), gpu=False)
             self.languages = selected
         raw = base64.b64decode(image_b64, validate=True)
         image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError("無法解碼鏡頭畫格。")
+        with contextlib.redirect_stdout(sys.stderr):
+            results = self.reader.readtext(image)
         items = [
             {"text": str(text), "confidence": round(float(confidence), 4)}
-            for _box, text, confidence in self.reader.readtext(image)
+            for _box, text, confidence in results
         ]
         parsed = parse_ocr(items)
         parsed["rewardConfig"] = dict(reward_config or {})

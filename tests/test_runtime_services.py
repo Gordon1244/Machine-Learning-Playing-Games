@@ -1,13 +1,17 @@
 import base64
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SPEC = importlib.util.spec_from_file_location("runtime_services", Path(__file__).parents[1] / "server" / "runtime_services.py")
@@ -80,6 +84,24 @@ class RuntimeServicesTest(unittest.TestCase):
         while self.project_id in self.services.ocr_pending and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertNotIn(self.project_id, self.services.ocr_pending)
+
+    def frame_payload(self, **values):
+        payload = {
+            "imageBase64": base64.b64encode(JPEG).decode("ascii"),
+            "cameraSessionId": "camera-session-1",
+        }
+        payload.update(values)
+        return payload
+
+    def prime_screen_verification(self, camera_session_id="camera-session-1"):
+        self.services.screen_verifications[self.project_id] = {
+            "cameraSessionId": camera_session_id,
+            "corners": [
+                {"x": 0.05, "y": 0.08}, {"x": 0.95, "y": 0.08},
+                {"x": 0.95, "y": 0.92}, {"x": 0.05, "y": 0.92},
+            ],
+            "consecutive": 2,
+        }
 
     def test_llm_url_normalization_and_key_never_written(self):
         self.assertEqual(self.services.normalize_url("http://localhost:11434"), "http://localhost:11434/v1")
@@ -171,7 +193,9 @@ class RuntimeServicesTest(unittest.TestCase):
         payload = {
             "imageBase64": base64.b64encode(JPEG).decode("ascii"), "runOcr": True, "menuMode": True,
             "menuWorkflowId": workflow["id"], "menuDemonstrationAction": {"buttons": {"dpad_right": True}, "sticks": {}, "durationMs": 120},
+            "cameraSessionId": "camera-session-1",
         }
+        self.prime_screen_verification()
         result = self.services.save_frame(self.project_id, payload)
         self.assertTrue(result["menuStepRecorded"])
         self.wait_for_ocr()
@@ -207,14 +231,15 @@ class RuntimeServicesTest(unittest.TestCase):
 
     def test_frame_is_saved_and_worker_action_is_returned(self):
         fake = self.use_fake_worker()
-        payload = {"imageBase64": base64.b64encode(JPEG).decode("ascii"), "runOcr": True}
+        self.prime_screen_verification()
+        payload = self.frame_payload(runOcr=True)
         result = self.services.save_frame(self.project_id, payload)
         self.assertTrue(result["state"]["ready"])
         self.assertTrue(result["action"]["buttons"]["a"])
         frames = list((self.projects / self.project_id / "datasets" / "trajectories").glob("*.jpg"))
         self.assertEqual(len(frames), 1)
         self.wait_for_ocr()
-        second = self.services.save_frame(self.project_id, {"imageBase64": payload["imageBase64"], "runOcr": False})
+        second = self.services.save_frame(self.project_id, self.frame_payload(runOcr=False))
         self.assertEqual(second["state"]["rank"], 1)
         self.assertEqual([item[0] for item in fake.calls].count("ocr"), 1)
         self.assertEqual([item[0] for item in fake.calls].count("detect_screen"), 2)
@@ -222,8 +247,66 @@ class RuntimeServicesTest(unittest.TestCase):
         self.assertEqual(len(engine_calls), 2)
         self.assertEqual(engine_calls[0][1]["imageBase64"], payload["imageBase64"])
 
+    def test_screen_requires_three_stable_frames_and_new_camera_resets_it(self):
+        fake = self.use_fake_worker()
+        first = self.services.save_frame(self.project_id, self.frame_payload(runOcr=False))
+        second = self.services.save_frame(self.project_id, self.frame_payload(runOcr=False))
+        third = self.services.save_frame(self.project_id, self.frame_payload(runOcr=False))
+
+        self.assertFalse(first["state"]["ready"])
+        self.assertEqual(first["state"]["verificationFrames"], 1)
+        self.assertIsNone(first["action"])
+        self.assertFalse(second["state"]["ready"])
+        self.assertEqual(second["state"]["verificationFrames"], 2)
+        self.assertTrue(third["state"]["ready"])
+        self.assertEqual(third["state"]["verificationFrames"], 3)
+        self.assertTrue(third["action"]["buttons"]["a"])
+        self.assertEqual([call[0] for call in fake.calls].count("engine_frame"), 1)
+
+        changed = self.services.save_frame(
+            self.project_id,
+            self.frame_payload(cameraSessionId="camera-session-2", runOcr=False),
+        )
+        self.assertFalse(changed["state"]["ready"])
+        self.assertEqual(changed["state"]["verificationFrames"], 1)
+        self.assertIsNone(changed["action"])
+
+    def test_frame_rejects_missing_camera_verification_session(self):
+        self.use_fake_worker()
+        with self.assertRaises(services_module.ServiceError) as raised:
+            self.services.save_frame(
+                self.project_id,
+                {"imageBase64": base64.b64encode(JPEG).decode("ascii"), "runOcr": False},
+            )
+        self.assertEqual(raised.exception.status, 400)
+
+    def test_shutdown_terminates_busy_training_worker_without_waiting_for_long_command(self):
+        class BusyLock:
+            def acquire(self, timeout=None):
+                self.timeout = timeout
+                return False
+
+        class BusyWorker:
+            def __init__(self):
+                self.process = object()
+                self.lock = BusyLock()
+                self.terminated = False
+
+            def terminate_process(self):
+                self.terminated = True
+                self.process = None
+
+        worker = BusyWorker()
+        self.services.worker = worker
+        started = time.monotonic()
+        self.services.stop_active_engine()
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(worker.lock.timeout, 2)
+        self.assertTrue(worker.terminated)
+
     def test_gamepad_demonstration_is_synchronized_with_saved_frame(self):
         self.use_fake_worker()
+        self.prime_screen_verification()
         action = {
             "sticks": {"left_stick_x": 50, "left_stick_y": -25, "right_stick_x": 0, "right_stick_y": 10},
             "buttons": {"a": True, "zr": True},
@@ -233,6 +316,7 @@ class RuntimeServicesTest(unittest.TestCase):
             {
                 "imageBase64": base64.b64encode(JPEG).decode("ascii"),
                 "runOcr": True,
+                "cameraSessionId": "camera-session-1",
                 "demonstrationAction": action,
                 "demonstrationController": "test-gamepad",
             },
@@ -311,11 +395,12 @@ class RuntimeServicesTest(unittest.TestCase):
                 return super().call(command, payload)
 
         worker = self.use_fake_worker(FailingWorker())
-        result = self.services.save_frame(self.project_id, {"imageBase64": base64.b64encode(JPEG).decode("ascii"), "runOcr": True})
+        self.prime_screen_verification()
+        result = self.services.save_frame(self.project_id, self.frame_payload(runOcr=True))
         self.assertTrue(result["state"]["ready"])
         self.assertEqual(result["state"]["confidence"], 0.9)
         self.wait_for_ocr()
-        second = self.services.save_frame(self.project_id, {"imageBase64": base64.b64encode(JPEG).decode("ascii"), "runOcr": False})
+        second = self.services.save_frame(self.project_id, self.frame_payload(runOcr=False))
         self.assertTrue(second["state"]["ready"])
         self.assertFalse(second["state"]["ocrReady"])
         self.assertIn("ocr failed", second["state"]["ocrMessage"])
@@ -323,9 +408,10 @@ class RuntimeServicesTest(unittest.TestCase):
 
     def test_project_confidence_threshold_blocks_otherwise_ready_frame(self):
         self.use_fake_worker()
+        self.prime_screen_verification()
         result = self.services.save_frame(
             self.project_id,
-            {"imageBase64": base64.b64encode(JPEG).decode("ascii"), "runOcr": True},
+            self.frame_payload(runOcr=True),
             confidence_threshold=0.95,
         )
         self.assertFalse(result["state"]["ready"])
@@ -340,10 +426,11 @@ class RuntimeServicesTest(unittest.TestCase):
 
         self.services.worker = FakeWorker()
         self.services.ocr_worker = SlowOcrWorker()
+        self.prime_screen_verification()
         started = time.monotonic()
         result = self.services.save_frame(
             self.project_id,
-            {"imageBase64": base64.b64encode(JPEG).decode("ascii"), "runOcr": True},
+            self.frame_payload(runOcr=True),
         )
         self.assertLess(time.monotonic() - started, 0.2)
         self.assertTrue(result["state"]["ready"])
@@ -406,34 +493,103 @@ class WorkerHelpersTest(unittest.TestCase):
         except ImportError:
             self.skipTest("OpenCV and numpy are required for screen detection")
 
-        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        image = np.full((720, 1280, 3), 18, dtype=np.uint8)
         polygon = np.array([[120, 90], [1170, 70], [1200, 650], [90, 670]], dtype=np.int32)
-        cv2.fillConvexPoly(image, polygon, (210, 210, 210))
+        cv2.fillConvexPoly(image, polygon, (42, 58, 74))
+        for x in range(180, 1080, 120):
+            cv2.line(image, (x, 145), (x + 70, 595), (40 + x % 180, 180, 225), 8)
+        for y in range(170, 590, 75):
+            cv2.rectangle(image, (210, y), (1050, y + 34), (210, 70 + y % 120, 55), -1)
+        cv2.putText(image, "12 / 12   148 km/h", (260, 390), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (255, 255, 255), 4)
         cv2.polylines(image, [polygon], True, (255, 255, 255), 12)
         encoded_ok, encoded = cv2.imencode(".jpg", image)
         self.assertTrue(encoded_ok)
         image_b64 = base64.b64encode(encoded.tobytes()).decode("ascii")
 
         automatic = worker_module.detect_screen(image_b64)
-        self.assertTrue(automatic["screenDetected"])
+        self.assertTrue(automatic["screenDetected"], automatic.get("screenEvidence"))
         self.assertEqual(automatic["cornerSource"], "auto")
         self.assertGreater(automatic["screenConfidence"], 0.9)
         self.assertEqual(len(automatic["screenCorners"]), 4)
         self.assertGreater(automatic["processedWidth"], 900)
+        self.assertGreater(automatic["screenEvidence"]["areaRatio"], 0.55)
+        self.assertGreaterEqual(automatic["screenEvidence"]["supportedEdges"], 3)
 
         manual_corners = [
             {"x": 0.1, "y": 0.12}, {"x": 0.91, "y": 0.1},
             {"x": 0.93, "y": 0.9}, {"x": 0.08, "y": 0.92},
         ]
         manual = worker_module.detect_screen(image_b64, manual_corners)
-        self.assertTrue(manual["screenDetected"])
+        self.assertTrue(manual["screenDetected"], manual.get("screenEvidence"))
         self.assertEqual(manual["cornerSource"], "manual")
         self.assertGreater(manual["processedHeight"], 500)
 
         locked = worker_module.detect_screen(image_b64, automatic["screenCorners"], "locked_auto")
         self.assertTrue(locked["screenDetected"])
         self.assertEqual(locked["cornerSource"], "locked_auto")
-        self.assertGreaterEqual(locked["screenConfidence"], 0.96)
+        self.assertGreaterEqual(locked["screenEvidence"]["supportedEdges"], 3)
+
+        false_whole_frame = worker_module.detect_screen(
+            image_b64,
+            [
+                {"x": 0.01, "y": 0.01}, {"x": 0.99, "y": 0.01},
+                {"x": 0.99, "y": 0.99}, {"x": 0.01, "y": 0.99},
+            ],
+        )
+        self.assertFalse(false_whole_frame["screenDetected"])
+        self.assertFalse(false_whole_frame["screenEvidence"]["boundaryPassed"])
+        self.assertLess(false_whole_frame["screenEvidence"]["supportedEdges"], 3)
+
+    def test_screen_detection_rejects_covered_or_blank_view(self):
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            self.skipTest("OpenCV and numpy are required for screen detection")
+
+        image = np.full((720, 1280, 3), 35, dtype=np.uint8)
+        encoded_ok, encoded = cv2.imencode(".jpg", image)
+        self.assertTrue(encoded_ok)
+        result = worker_module.detect_screen(
+            base64.b64encode(encoded.tobytes()).decode("ascii"),
+            [
+                {"x": 0.1, "y": 0.1}, {"x": 0.9, "y": 0.1},
+                {"x": 0.9, "y": 0.9}, {"x": 0.1, "y": 0.9},
+            ],
+        )
+        self.assertFalse(result["screenDetected"])
+        self.assertFalse(result["screenEvidence"]["boundaryPassed"])
+        self.assertFalse(result["screenEvidence"]["contentPassed"])
+
+    def test_ocr_library_progress_cannot_corrupt_worker_stdout_protocol(self):
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            self.skipTest("OpenCV and numpy are required for OCR protocol isolation")
+
+        class NoisyReader:
+            def __init__(self, *_args, **_kwargs):
+                print("model loading progress")
+
+            def readtext(self, _image):
+                print("ocr progress")
+                return [([], "排名 1 / 12", 0.9)]
+
+        image = np.full((80, 160, 3), 100, dtype=np.uint8)
+        encoded_ok, encoded = cv2.imencode(".jpg", image)
+        self.assertTrue(encoded_ok)
+        image_b64 = base64.b64encode(encoded.tobytes()).decode("ascii")
+        status = {"opencv": True, "easyocr": True, "numpy": True}
+        stdout = io.StringIO()
+        with mock.patch.object(worker_module, "modules", return_value=status):
+            with mock.patch.dict(sys.modules, {"easyocr": types.SimpleNamespace(Reader=NoisyReader)}):
+                with contextlib.redirect_stdout(stdout):
+                    result = worker_module.OcrEngine().read(image_b64, ["ch_tra", "en"])
+
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["rank"], 1)
 
     def test_parse_ocr_extracts_basic_racing_values(self):
         state = worker_module.parse_ocr([{"text": "排名 2 / 12 150 km/h 45%", "confidence": 0.8}])

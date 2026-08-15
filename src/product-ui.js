@@ -1296,7 +1296,8 @@
           menuMode: Boolean(ui.menuTeaching || ui.menuTaskRunning),
           menuWorkflowId: ui.menuTeaching?.id || "",
           menuDemonstrationAction: menuDemonstration?.action,
-          screenCorners: runtime.state.screenDetected || runtime.state.screenCornersManual ? runtime.state.screenCorners : [],
+          cameraSessionId: runtime.state.cameraVerificationId,
+          screenCorners: runtime.state.screenDetected || runtime.state.screenCandidatePassed || runtime.state.screenCornersManual ? runtime.state.screenCorners : [],
           screenCornerSource: runtime.state.screenCornersManual ? "manual" : "locked_auto"
         }
       });

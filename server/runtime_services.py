@@ -364,6 +364,7 @@ class RuntimeServices:
         self.latest_images: dict[str, str] = {}
         self.latest_ocr: dict[str, dict[str, Any]] = {}
         self.ocr_pending: set[str] = set()
+        self.screen_verifications: dict[str, dict[str, Any]] = {}
         self.latest_states: dict[str, dict[str, Any]] = {}
         self.vision_llm_times: dict[str, float] = {}
         self.offline_parser = OfflineIntentParser()
@@ -1571,6 +1572,58 @@ class RuntimeServices:
 
         self.ocr_executor.submit(run)
 
+    def verify_screen_stability(
+        self,
+        project_id: str,
+        screen: dict[str, Any],
+        confidence_threshold: float,
+        camera_session_id: str,
+    ) -> dict[str, Any]:
+        required_frames = 3
+        corners = screen.get("screenCorners")
+        qualified = (
+            bool(screen.get("screenDetected"))
+            and float(screen.get("screenConfidence") or 0) >= confidence_threshold
+            and isinstance(corners, list)
+            and len(corners) == 4
+        )
+        with self.lock:
+            current = self.screen_verifications.get(project_id)
+            if current is None or current.get("cameraSessionId") != camera_session_id:
+                current = {
+                    "cameraSessionId": camera_session_id,
+                    "corners": None,
+                    "consecutive": 0,
+                }
+            if qualified:
+                previous = current.get("corners")
+                stable = False
+                if isinstance(previous, list) and len(previous) == 4:
+                    try:
+                        maximum_shift = max(
+                            ((float(point["x"]) - float(old["x"])) ** 2 + (float(point["y"]) - float(old["y"])) ** 2) ** 0.5
+                            for point, old in zip(corners, previous)
+                        )
+                        stable = maximum_shift <= 0.04
+                    except (KeyError, TypeError, ValueError):
+                        stable = False
+                current["consecutive"] = int(current.get("consecutive") or 0) + 1 if stable else 1
+                current["corners"] = [dict(point) for point in corners]
+            else:
+                current["consecutive"] = 0
+                current["corners"] = None
+            self.screen_verifications[project_id] = current
+            consecutive = int(current["consecutive"])
+
+        verified = qualified and consecutive >= required_frames
+        screen["rawScreenDetected"] = bool(screen.get("screenDetected"))
+        screen["screenDetected"] = verified
+        screen["verificationFrames"] = consecutive
+        screen["verificationRequired"] = required_frames
+        if qualified and not verified:
+            screen["message"] = f"螢幕候選已通過單張檢查，正在確認位置穩定（{consecutive}/{required_frames}）。請保持鏡頭不動。"
+        return screen
+
     def save_frame(
         self,
         project_id: str,
@@ -1620,6 +1673,9 @@ class RuntimeServices:
         requested_corners = payload.get("screenCorners")
         if requested_corners is not None and not isinstance(requested_corners, list):
             raise ServiceError(400, "螢幕四角資料格式不正確。")
+        camera_session_id = str(payload.get("cameraSessionId", "")).strip()
+        if not camera_session_id or len(camera_session_id) > 128:
+            raise ServiceError(400, "鏡頭驗證工作階段不存在或格式不正確，請重新開啟鏡頭。")
         try:
             screen = self.worker.call(
                 "detect_screen",
@@ -1638,6 +1694,13 @@ class RuntimeServices:
                 "message": worker_error.message,
                 "processedImageBase64": image_b64,
             }
+        threshold = min(max(float(confidence_threshold), 0.0), 1.0)
+        screen = self.verify_screen_stability(
+            project_id,
+            screen,
+            threshold,
+            camera_session_id,
+        )
         processed_image_b64 = str(screen.pop("processedImageBase64", "") or image_b64)
         with self.lock:
             cached_ocr = dict(self.latest_ocr.get(project_id, {}))
@@ -1680,19 +1743,21 @@ class RuntimeServices:
                 reward_config,
             )
             ocr_pending = True
-        threshold = min(max(float(confidence_threshold), 0.0), 1.0)
         state["confidenceThreshold"] = threshold
         state["confidence"] = float(state.get("screenConfidence") or 0)
         state["ocrPending"] = ocr_pending
         if not state.get("screenDetected") or state["confidence"] < threshold:
             state["ready"] = False
-            state["message"] = f"尚未可靠偵測到螢幕四角（需要 {threshold:.2f}）。請移動四角控制點或重新自動偵測。"
+            if not state.get("message"):
+                state["message"] = f"尚未可靠偵測到螢幕四角（需要 {threshold:.2f}）。請移動四角控制點或重新自動偵測。"
         else:
             state["ready"] = True
             state["message"] = "已偵測並裁切螢幕四角。" + ("文字辨識正在背景處理。" if ocr_pending else "")
         self.latest_states[project_id] = dict(state)
         if menu_mode:
             engine = {"action": None, "message": "選單畫格已與賽車 PPO 資料隔離。"}
+        elif not state["ready"]:
+            engine = {"action": None, "ready": False, "message": "螢幕尚未完成精準驗證，不會產生控制動作。"}
         else:
             try:
                 engine = self.worker.call("engine_frame", {"state": state, "imageBase64": processed_image_b64})
@@ -1710,7 +1775,7 @@ class RuntimeServices:
                 },
             )
         demonstration_recorded = False
-        if demonstration_action is not None and frame_path is not None:
+        if demonstration_action is not None and frame_path is not None and state["ready"]:
             normalized_demo = self.normalize_demonstration_action(demonstration_action)
             append_jsonl(
                 project / "datasets" / "trajectories" / "demonstrations.jsonl",
@@ -1725,7 +1790,7 @@ class RuntimeServices:
             )
             demonstration_recorded = True
         menu_step_recorded = False
-        if menu_workflow_id and menu_action is not None:
+        if menu_workflow_id and menu_action is not None and state["ready"]:
             menu_step_recorded = self.append_menu_workflow_step(project_id, menu_workflow_id, menu_action, raw)
         if important_events and (state.get("failed") or state.get("crashed")):
             event_name = "failure" if state.get("failed") else "collision"
@@ -1956,12 +2021,23 @@ class RuntimeServices:
         })
 
     def stop_active_engine(self) -> None:
-        if getattr(self.worker, "process", None) is None:
+        worker = self.worker
+        if getattr(worker, "process", None) is None:
+            return
+        worker_lock = getattr(worker, "lock", None)
+        acquired = bool(worker_lock and worker_lock.acquire(timeout=2))
+        if worker_lock and not acquired:
+            if hasattr(worker, "terminate_process"):
+                worker.terminate_process()
             return
         try:
-            self.worker.call("engine_stop")
-        except ServiceError:
-            pass
+            worker.call("engine_stop", timeout_seconds=3)
+        except (ServiceError, TypeError):
+            if hasattr(worker, "terminate_process"):
+                worker.terminate_process()
+        finally:
+            if acquired:
+                worker_lock.release()
 
     def shutdown(self) -> None:
         self.stop_active_engine()

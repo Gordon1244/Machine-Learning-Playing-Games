@@ -369,6 +369,12 @@ test("UI source does not expose fake hardware or fake training success paths", (
   assert.equal(appSource.includes('data-screen-corner="${index}"'), true);
   assert.equal(appSource.includes("bindScreenCornerControls()"), true);
   assert.equal(appSource.includes("state.screenDetected"), true);
+  assert.equal(appSource.includes("cameraVerificationId"), true);
+  assert.equal(appSource.includes("screenVerificationFrames"), true);
+  assert.equal(appSource.includes("screenCandidatePassed"), true);
+  assert.equal(appSource.includes("4 條邊與框內內容已檢查"), true);
+  assert.equal(appSource.includes('overlay.toggleAttribute("hidden", !showScreenCorners)'), true);
+  assert.equal(appSource.includes('data-action="manual-screen-corners"'), true);
   assert.equal(appSource.includes('data-manual-stick="left"'), true);
   assert.equal(appSource.includes('data-manual-button="${input}"'), true);
   assert.equal(appSource.includes("manualPreflight"), true);
@@ -436,6 +442,7 @@ test("product UI includes persistent projects, snapshots, logs, and realtime mon
   assert(source.includes("/api/llm/detect"));
   assert(source.includes("/assistant/chat"));
   assert(source.includes("/vision/frame"));
+  assert(source.includes("cameraSessionId: runtime.state.cameraVerificationId"));
   assert(source.includes("/datasets/video"));
   assert(source.includes("startVisionCapture"));
   assert(source.includes("讓 LLM 看目前畫面"));

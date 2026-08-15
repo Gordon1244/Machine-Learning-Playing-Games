@@ -76,9 +76,19 @@ class StoreTest(unittest.TestCase):
     def test_hard_limits_clamp_and_unconnected_engine_rejects_resume(self):
         project = self.store.create_project({"name": "Limits"})
         project_id = project["manifest"]["id"]
-        settings = self.store.put_project_settings(project_id, {"controller": {"maxPressMs": 999999, "maxTravelMm": 999}})
+        settings = self.store.put_project_settings(project_id, {
+            "controller": {"maxPressMs": 999999, "maxTravelMm": 999},
+            "output": {
+                "manualInputRefreshMs": 5,
+                "manualStickDeadzonePercent": 90,
+                "manualStickSensitivityPercent": 999,
+            },
+        })
         self.assertEqual(settings["effective"]["controller"]["maxPressMs"], 2000)
         self.assertEqual(settings["effective"]["controller"]["maxTravelMm"], 20)
+        self.assertEqual(settings["effective"]["output"]["manualInputRefreshMs"], 80)
+        self.assertEqual(settings["effective"]["output"]["manualStickDeadzonePercent"], 30)
+        self.assertEqual(settings["effective"]["output"]["manualStickSensitivityPercent"], 150)
         with self.assertRaises(app.ApiError):
             self.store.control(project_id, "resume", {})
         paused = self.store.control(project_id, "pause", {})
@@ -246,11 +256,11 @@ class StoreTest(unittest.TestCase):
         self.store.action_nxbt(project_id, {"buttons": {"a": True}}, manual_demonstration=True)
         self.assertEqual(sent[-1][0], "/action")
         self.store.action_nxbt(project_id, {"manualControl": True, "buttons": {"plus": True}})
-        self.assertEqual(sent[-1][0], "/test-input")
-        self.assertEqual(sent[-1][1]["operation"], "plus")
+        self.assertEqual(sent[-1][0], "/manual-action")
+        self.assertTrue(sent[-1][1]["buttons"]["plus"])
         runtime["visionReady"] = False
         self.store.action_nxbt(project_id, {"manualControl": True, "sticks": {"left_stick_y": -80}})
-        self.assertEqual(sent[-1][0], "/action")
+        self.assertEqual(sent[-1][0], "/manual-action")
         runtime["visionReady"] = True
         self.store.action_nxbt(project_id, {"durationMs": 999, "buttons": {"dpad_right": True}}, menu_action=True)
         self.assertEqual(sent[-1][1]["durationMs"], 250)
@@ -263,6 +273,22 @@ class StoreTest(unittest.TestCase):
             self.store.action_nxbt(project_id, {"buttons": {"a": True}}, manual_demonstration=True)
         with self.assertRaises(app.ApiError):
             self.store.action_nxbt(project_id, {"buttons": {"dpad_right": True}}, menu_action=True)
+        with self.assertRaises(app.ApiError):
+            self.store.action_nxbt(project_id, {"manualControl": True, "manualTakeover": True, "buttons": {"a": True}})
+        runtime["mode"] = "live"
+        runtime["visionReady"] = True
+        taken_over = self.store.action_nxbt(project_id, {
+            "manualControl": True,
+            "manualTakeover": True,
+            "durationMs": 100,
+            "sticks": {"left_stick_x": 45, "left_stick_y": -70},
+            "buttons": {"a": True, "zr": True},
+        })
+        self.assertTrue(taken_over["ok"])
+        self.assertEqual(sent[-1][0], "/manual-action")
+        self.assertEqual(sent[-1][1]["sticks"]["left_stick_y"], -70)
+        self.assertTrue(sent[-1][1]["buttons"]["a"])
+        self.assertTrue(sent[-1][1]["buttons"]["zr"])
         self.store.action_nxbt(project_id, {"durationMs": 9999, "sticks": {"left_stick_x": 999}, "buttons": {"a": True}})
         self.assertEqual(sent[-1][1]["durationMs"], 1500)
         self.assertEqual(sent[-1][1]["sticks"]["left_stick_x"], 100)
@@ -298,6 +324,8 @@ class StoreTest(unittest.TestCase):
 
         prepared = self.store.test_nxbt_input(project_id, {"interface": "sticks", "operation": "left:prepare", "screenConfirmed": True})
         self.assertTrue(prepared["ok"])
+        self.assertEqual(prepared["coordinateSystem"], "NXBT 原生座標：X 右為正，Y 上為正，範圍 -100..100。")
+        self.assertEqual(prepared["command"]["sticks"]["left_stick_x"], 100)
         self.assertEqual(sent[-1][0], "/test-input")
         self.assertEqual(sent[-1][1]["action"]["durationMs"], 1200)
         self.assertEqual(sent[-1][1]["action"]["sticks"]["left_stick_x"], 100)

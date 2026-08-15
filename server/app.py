@@ -183,6 +183,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "output": {
         "backend": "mechanical_rig",
         "commandRateHz": 10,
+        "manualInputRefreshMs": 120,
+        "manualStickDeadzonePercent": 8,
+        "manualStickSensitivityPercent": 100,
         "nxbtReconnect": True,
         "nxbtHost": "127.0.0.1",
         "nxbtPort": 8766,
@@ -305,6 +308,9 @@ HARD_LIMITS = {
     ("controller", "maxTravelMm"): (1, 20),
     ("controller", "lostConnectionReturnHomeMs"): (50, 10000),
     ("output", "commandRateHz"): (1, 60),
+    ("output", "manualInputRefreshMs"): (80, 500),
+    ("output", "manualStickDeadzonePercent"): (0, 30),
+    ("output", "manualStickSensitivityPercent"): (50, 150),
     ("output", "nxbtPort"): (1, 65535),
     ("training", "explorationRate"): (0, 1),
     ("training", "demonstrationEpochs"): (1, 20),
@@ -1210,12 +1216,19 @@ class Store:
                 },
             )
         self.prune_log_storage(project_id)
-        return {"ok": bool(result.get("ok")), "operation": operation, "message": f"NXBT 測試已送出：{label}。動作結束後已回到中立。"}
+        return {
+            "ok": bool(result.get("ok")),
+            "operation": operation,
+            "command": normalized,
+            "coordinateSystem": "NXBT 原生座標：X 右為正，Y 上為正，範圍 -100..100。",
+            "message": f"NXBT 測試已送出：{label}。動作結束後已回到中立。",
+        }
 
     def action_nxbt(self, project_id: str, payload: dict[str, Any], manual_demonstration: bool = False, menu_action: bool = False) -> dict[str, Any]:
         self.require_project(project_id)
         payload = dict(payload) if isinstance(payload, dict) else payload
         manual_control = bool(payload.pop("manualControl", False)) if isinstance(payload, dict) else False
+        manual_takeover = bool(payload.pop("manualTakeover", False)) if isinstance(payload, dict) else False
         normalized, neutral = self.normalize_nxbt_action(
             project_id,
             payload,
@@ -1236,8 +1249,15 @@ class Store:
             not runtime["engineReady"] or runtime["mode"] not in {"training", "live", "canary"}
         )
         demonstration_blocked = (manual_demonstration or menu_action) and runtime["mode"] != "idle"
+        manual_idle_allowed = runtime["mode"] == "idle" and not manual_takeover
+        manual_live_allowed = (
+            runtime["mode"] == "live"
+            and manual_takeover
+            and runtime["engineReady"]
+            and runtime["visionReady"]
+        )
         manual_blocked = manual_control and (
-            runtime["mode"] != "idle"
+            not (manual_idle_allowed or manual_live_allowed)
             or runtime["paused"]
             or not runtime["controllerReady"]
             or not runtime["emergencyStopVerified"]
@@ -1248,30 +1268,25 @@ class Store:
         if menu_action:
             engine_blocked = False
         if not neutral and manual_blocked:
-            raise ApiError(HTTPStatus.CONFLICT, "人工控制已阻止：只能在訓練停止、控制器連線且軟體急停已驗證時使用。")
+            raise ApiError(HTTPStatus.CONFLICT, "人工控制已阻止：只能在停止狀態做前置操作，或在引擎、可信畫面、控制器與急停均就緒的正式遊玩中接管。")
         if not neutral and (runtime_blocked or engine_blocked or demonstration_blocked):
             raise ApiError(HTTPStatus.CONFLICT, "NXBT 動作已阻止：引擎、鏡頭辨識、控制器或軟體急停驗證尚未完成。")
         with self.lock:
             connector = self.nxbt_connectors.get(project_id)
         if not connector:
             raise ApiError(HTTPStatus.CONFLICT, "NXBT 尚未連線，不能送出控制命令。")
-        active_buttons = [key for key, pressed in normalized["buttons"].items() if pressed]
-        has_stick_input = any(normalized["sticks"].values())
-        if manual_control and len(active_buttons) == 1 and not has_stick_input:
-            try:
-                result = self.nxbt_request(
-                    connector,
-                    "/test-input",
-                    {"operation": active_buttons[0], "action": normalized},
-                    timeout=5,
-                )
-            except ApiError as bridge_error:
+        bridge_path = "/manual-action" if manual_control else "/action"
+        try:
+            result = self.nxbt_request(connector, bridge_path, normalized, timeout=5)
+        except ApiError as bridge_error:
+            if manual_control:
                 raise ApiError(
                     HTTPStatus.CONFLICT,
-                    "NXBT bridge 尚未支援可靠人工按鍵。請把最新版 tools/nxbt_bridge.py 與 tools/nxbt_bridge_server.py 複製到 VM 並重新啟動。",
+                    "NXBT bridge 尚未支援正式遊玩人工接管。請把最新版 tools/nxbt_bridge.py 與 tools/nxbt_bridge_server.py 複製到 VM，重新啟動 bridge 後再試。",
                 ) from bridge_error
-        else:
-            result = self.nxbt_request(connector, "/action", normalized, timeout=5)
+            raise
+        if not result.get("ok"):
+            raise ApiError(HTTPStatus.CONFLICT, "NXBT VM bridge 沒有確認人工或引擎控制命令。")
         if self.get_project_settings(project_id)["effective"]["logging"].get("actions", True):
             append_jsonl(
                 self.require_project(project_id) / "logs" / f"actions-{datetime.now().strftime('%Y-%m-%d')}.jsonl",
@@ -1279,12 +1294,17 @@ class Store:
                     "timestamp": utc_now(),
                     "action": "nxbt_manual_action" if manual_control else "nxbt_menu_action" if menu_action else "nxbt_demonstration_action" if manual_demonstration else "nxbt_action",
                     "backend": "nxbt_bluetooth",
-                    "result": "sent",
-                    "details": normalized,
+                    "result": "preempted" if result.get("preempted") else "sent",
+                    "details": {**normalized, "manualTakeover": manual_takeover if manual_control else False},
                 },
             )
         self.prune_log_storage(project_id)
-        return {"ok": bool(result.get("ok")), "message": "NXBT 控制命令已送出。"}
+        return {
+            "ok": bool(result.get("ok")),
+            "preempted": bool(result.get("preempted")),
+            "command": normalized,
+            "message": "NXBT 控制命令已送出。",
+        }
 
     def emergency_stop_nxbt(self, project_id: str) -> dict[str, Any]:
         self.require_project(project_id)

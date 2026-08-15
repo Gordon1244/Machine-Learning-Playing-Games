@@ -23,6 +23,9 @@
     maxPressMs: "按鍵最長持續按壓時間。後端硬性上限為 2000 ms。",
     maxTravelMm: "機械模組最大行程。後端硬性上限為 20 mm。",
     backend: "選擇機械治具、NXBT 或混合輸出。",
+    manualInputRefreshMs: "人工控制多久更新一次方向與按鍵。推薦 120 ms；太高會有延遲，太低會增加 localhost、VM 與 Serial 負載。",
+    manualStickDeadzonePercent: "搖桿中心附近忽略輸入的範圍。推薦 8%；太低可能漂移，太高會讓小幅轉向不容易。",
+    manualStickSensitivityPercent: "人工搖桿輸出的靈敏度。推薦 100%；太高容易過度轉向，太低可能推不到底。",
     nxbtHost: "Windows 或 macOS 請先依 README 建立 NXBT VM 本機轉送，再填入 127.0.0.1。不要直接填 VirtualBox NAT 位址 10.0.2.15。Linux 原生執行通常也使用 127.0.0.1。",
     nxbtPort: "NXBT VM bridge 監聽的連接埠。推薦維持 8766。",
     nxbtReconnect: "已經配對過 Switch 時可加速重連。第一次配對失敗時請關閉。",
@@ -78,6 +81,9 @@
     lostConnectionReturnHomeMs: "失聯回中立毫秒",
     backend: "控制輸出方式",
     commandRateHz: "每秒輸出命令數",
+    manualInputRefreshMs: "人工控制更新間隔 ms",
+    manualStickDeadzonePercent: "人工搖桿死區 %",
+    manualStickSensitivityPercent: "人工搖桿靈敏度 %",
     nxbtReconnect: "NXBT 自動重新連線",
     nxbtHost: "NXBT 本機轉送位址",
     nxbtPort: "NXBT VM 連接埠",
@@ -180,6 +186,15 @@
     manualControlTimer: null,
     manualControlBusy: false,
     manualControlAction: null,
+    manualHeldButtons: new Set(),
+    manualSticks: {
+      left: { x: 0, y: 0 },
+      right: { x: 0, y: 0 }
+    },
+    manualLatchButtons: false,
+    manualTakeoverActive: false,
+    manualControlSequence: 0,
+    lastManualBlockLogAt: 0,
     shuttingDown: false,
     menuTeaching: null,
     menuTaskRunning: false
@@ -286,6 +301,12 @@
       window.setInterval(() => saveState("five_minute_autosave"), 5 * 60 * 1000);
       window.addEventListener("switch2-state-change", scheduleSave);
       window.addEventListener("beforeunload", () => saveState("window_close", true));
+      window.addEventListener("blur", () => {
+        if (manualInputActive() || ui.manualTakeoverActive) void neutralizeManualController();
+      });
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden && (manualInputActive() || ui.manualTakeoverActive)) void neutralizeManualController();
+      });
     } catch (error) {
       runtime.showToast(`本機後端尚未啟動：${error.message}`);
     }
@@ -1323,22 +1344,61 @@
     await captureVisionFrame();
   }
 
-  function manualAction({ stick = "", x = 0, y = 0, button = "" } = {}) {
-    const sticks = {};
-    if (stick) {
-      sticks[`${stick}_stick_x`] = Math.round(Math.max(-100, Math.min(100, x)));
-      sticks[`${stick}_stick_y`] = Math.round(Math.max(-100, Math.min(100, y)));
-    }
+  function manualInputTiming() {
+    const configured = Number(runtime.state.runtimeSettings.output?.manualInputRefreshMs);
+    const refreshMs = Math.round(Math.max(80, Math.min(500, Number.isFinite(configured) ? configured : 120)));
+    return { refreshMs, durationMs: Math.max(40, refreshMs - 20) };
+  }
+
+  function shapeManualStick(x, y) {
+    const output = runtime.state.runtimeSettings.output || {};
+    const deadzone = Math.max(0, Math.min(0.3, (Number(output.manualStickDeadzonePercent) || 8) / 100));
+    const sensitivity = Math.max(0.5, Math.min(1.5, (Number(output.manualStickSensitivityPercent) || 100) / 100));
+    const length = Math.min(1, Math.hypot(x, y) / 100);
+    if (length <= deadzone) return { x: 0, y: 0 };
+    const shapedLength = Math.min(1, ((length - deadzone) / Math.max(0.01, 1 - deadzone)) * sensitivity);
+    const scale = shapedLength / Math.max(length, 0.001);
     return {
-      durationMs: 180,
-      priority: "manual",
-      sticks,
-      buttons: button ? { [button]: true } : {}
+      x: Math.round(Math.max(-100, Math.min(100, x * scale))),
+      y: Math.round(Math.max(-100, Math.min(100, y * scale)))
     };
   }
 
+  function manualAction() {
+    const { durationMs } = manualInputTiming();
+    return {
+      durationMs,
+      priority: "manual",
+      sticks: {
+        left_stick_x: ui.manualSticks.left.x,
+        left_stick_y: ui.manualSticks.left.y,
+        right_stick_x: ui.manualSticks.right.x,
+        right_stick_y: ui.manualSticks.right.y
+      },
+      buttons: Object.fromEntries(Array.from(ui.manualHeldButtons, (button) => [button, true]))
+    };
+  }
+
+  function manualInputActive() {
+    return ui.manualHeldButtons.size > 0
+      || Object.values(ui.manualSticks).some((stick) => stick.x !== 0 || stick.y !== 0);
+  }
+
+  function describeManualAction(action) {
+    const sticks = action.sticks || {};
+    const activeSticks = ["left", "right"].flatMap((side) => {
+      const x = Number(sticks[`${side}_stick_x`] || 0);
+      const browserY = Number(sticks[`${side}_stick_y`] || 0);
+      if (!x && !browserY) return [];
+      const label = side === "left" ? "左" : "右";
+      return [`${label}桿 X ${x}, Y ${browserY}（NXBT Y ${-browserY}）`];
+    });
+    const buttons = Object.keys(action.buttons || {}).filter((key) => action.buttons[key]).map((key) => key.toUpperCase());
+    return [...activeSticks, buttons.length ? `按鍵 ${buttons.join("+")}` : ""].filter(Boolean).join("；") || "中立";
+  }
+
   function updateManualStatus(message, error = false) {
-    const status = document.querySelector("#manualControlStatus");
+    const status = document.querySelector("[data-manual-control-status]");
     if (!status) return;
     status.textContent = message;
     status.classList.toggle("error", error);
@@ -1346,24 +1406,37 @@
 
   async function dispatchManualControllerAction(action) {
     if (!requireProject()) throw new Error("請先選擇遊戲專案。");
-    if (runtime.state.engineMode !== "idle" || runtime.state.controlPaused) throw new Error("請先停止訓練或正式遊玩，再使用人工控制。");
+    const liveTakeover = runtime.state.engineMode === "live";
+    if (!liveTakeover && runtime.state.engineMode !== "idle") throw new Error("人工控制只能在訓練停止時，或正式遊玩人工接管時使用。");
+    if (runtime.state.controlPaused) throw new Error("控制目前已暫停，不能送出人工輸入。");
+    if (liveTakeover && !runtime.canRouteEngineAction()) throw new Error("正式遊玩的引擎或安全閘門未就緒，不能人工接管。");
     const backend = runtime.state.outputBackend;
     if (backend === "mechanical_rig" || backend === "hybrid") {
-      await runtime.routeRigAction(action, { manualPreflight: true });
+      await runtime.routeRigAction(action, liveTakeover ? {} : { manualPreflight: true });
     }
     if (backend === "nxbt_bluetooth" || backend === "hybrid") {
       await api(`/api/projects/${encodeURIComponent(ui.current.manifest.id)}/nxbt/manual-action`, {
         method: "POST",
-        json: action
+        json: { ...action, manualTakeover: liveTakeover }
       });
     }
   }
 
-  async function neutralizeManualController() {
+  function resetManualInputState() {
     window.clearInterval(ui.manualControlTimer);
     ui.manualControlTimer = null;
     ui.manualControlAction = null;
+    ui.manualHeldButtons.clear();
+    ui.manualSticks.left = { x: 0, y: 0 };
+    ui.manualSticks.right = { x: 0, y: 0 };
+    document.querySelectorAll("[data-manual-button].is-active").forEach((button) => button.classList.remove("is-active"));
     document.querySelectorAll(".manual-stick-knob").forEach((knob) => { knob.style.transform = "translate(0px, 0px)"; });
+  }
+
+  async function neutralizeManualController() {
+    const sequence = ++ui.manualControlSequence;
+    const wasTakeover = ui.manualTakeoverActive;
+    resetManualInputState();
     try {
       const backend = runtime.state.outputBackend;
       if (backend === "mechanical_rig" || backend === "hybrid") await runtime.routeRigNeutral();
@@ -1373,50 +1446,91 @@
           json: { durationMs: 20, sticks: {}, buttons: {} }
         });
       }
-      updateManualStatus("控制器已回到中立。");
+      if (sequence === ui.manualControlSequence) updateManualStatus(wasTakeover ? "已確認回中立，控制已交還 AI。" : "控制器已回到中立。");
     } catch (error) {
       updateManualStatus(`回中立未確認：${error.message}`, true);
+    } finally {
+      if (sequence === ui.manualControlSequence) ui.manualTakeoverActive = false;
     }
   }
 
   async function sendCurrentManualAction() {
     if (ui.manualControlBusy || !ui.manualControlAction) return;
     ui.manualControlBusy = true;
+    const sequence = ui.manualControlSequence;
     try {
-      await dispatchManualControllerAction(ui.manualControlAction);
-      updateManualStatus("人工控制命令已送出；放開後會自動回中立。");
+      const action = ui.manualControlAction;
+      await dispatchManualControllerAction(action);
+      if (sequence === ui.manualControlSequence) updateManualStatus(`${ui.manualTakeoverActive ? "人工接管中" : "人工控制已送出"}：${describeManualAction(action)}。`);
     } catch (error) {
-      window.clearInterval(ui.manualControlTimer);
-      ui.manualControlTimer = null;
-      ui.manualControlAction = null;
-      updateManualStatus(`人工控制未送出：${error.message}`, true);
+      if (sequence === ui.manualControlSequence) {
+        resetManualInputState();
+        ui.manualTakeoverActive = false;
+        updateManualStatus(`人工控制未送出：${error.message}`, true);
+      }
     } finally {
       ui.manualControlBusy = false;
     }
   }
 
-  function beginManualControl(action) {
-    window.clearInterval(ui.manualControlTimer);
-    ui.manualControlAction = action;
+  function refreshManualControl() {
+    if (!manualInputActive()) {
+      void neutralizeManualController();
+      return;
+    }
+    ui.manualControlSequence += 1;
+    ui.manualControlAction = manualAction();
+    ui.manualTakeoverActive = runtime.state.engineMode === "live";
     void sendCurrentManualAction();
-    ui.manualControlTimer = window.setInterval(sendCurrentManualAction, 220);
+    if (!ui.manualControlTimer) ui.manualControlTimer = window.setInterval(sendCurrentManualAction, manualInputTiming().refreshMs);
   }
 
-  function bindTrainingManualControls(root) {
+  function bindManualControllerControls(root) {
+    const latch = root.querySelector("[data-manual-latch]");
+    if (latch) {
+      latch.checked = ui.manualLatchButtons;
+      latch.addEventListener("change", () => {
+        ui.manualLatchButtons = latch.checked;
+        if (!ui.manualLatchButtons && ui.manualHeldButtons.size) {
+          ui.manualHeldButtons.clear();
+          root.querySelectorAll("[data-manual-button].is-active").forEach((button) => button.classList.remove("is-active"));
+          refreshManualControl();
+        }
+      });
+    }
     root.querySelectorAll("[data-manual-button]").forEach((button) => {
       button.addEventListener("pointerdown", (event) => {
         event.preventDefault();
         if (button.disabled) return;
+        const input = button.dataset.manualButton;
+        if (ui.manualLatchButtons) {
+          if (ui.manualHeldButtons.has(input)) ui.manualHeldButtons.delete(input);
+          else ui.manualHeldButtons.add(input);
+          button.classList.toggle("is-active", ui.manualHeldButtons.has(input));
+          refreshManualControl();
+          return;
+        }
         button.setPointerCapture(event.pointerId);
-        beginManualControl(manualAction({ button: button.dataset.manualButton }));
+        button.dataset.manualPressed = "true";
+        ui.manualHeldButtons.add(input);
+        button.classList.add("is-active");
+        refreshManualControl();
       });
-      const release = () => void neutralizeManualController();
+      const release = () => {
+        if (ui.manualLatchButtons || button.dataset.manualPressed !== "true") return;
+        delete button.dataset.manualPressed;
+        ui.manualHeldButtons.delete(button.dataset.manualButton);
+        button.classList.remove("is-active");
+        refreshManualControl();
+      };
       button.addEventListener("pointerup", release);
       button.addEventListener("pointercancel", release);
+      button.addEventListener("lostpointercapture", release);
     });
     root.querySelectorAll("[data-manual-stick]").forEach((stickPad) => {
       const knob = stickPad.querySelector(".manual-stick-knob");
       const side = stickPad.dataset.manualStick;
+      let activePointerId = null;
       const move = (event) => {
         const box = stickPad.getBoundingClientRect();
         const radius = Math.max(1, Math.min(box.width, box.height) * 0.37);
@@ -1428,33 +1542,52 @@
           dy = dy / length * radius;
         }
         if (knob) knob.style.transform = `translate(${dx}px, ${dy}px)`;
-        ui.manualControlAction = manualAction({ stick: side, x: dx / radius * 100, y: dy / radius * 100 });
-        void sendCurrentManualAction();
+        ui.manualSticks[side] = shapeManualStick(dx / radius * 100, dy / radius * 100);
+        refreshManualControl();
       };
       stickPad.addEventListener("pointerdown", (event) => {
         event.preventDefault();
+        if (activePointerId !== null) return;
+        activePointerId = event.pointerId;
         stickPad.setPointerCapture(event.pointerId);
-        beginManualControl(manualAction({ stick: side }));
         move(event);
       });
       stickPad.addEventListener("pointermove", (event) => {
         if (stickPad.hasPointerCapture(event.pointerId)) move(event);
       });
-      stickPad.addEventListener("pointerup", () => void neutralizeManualController());
-      stickPad.addEventListener("pointercancel", () => void neutralizeManualController());
+      const release = (event) => {
+        if (activePointerId === null || (event?.pointerId !== undefined && event.pointerId !== activePointerId)) return;
+        activePointerId = null;
+        ui.manualSticks[side] = { x: 0, y: 0 };
+        if (knob) knob.style.transform = "translate(0px, 0px)";
+        refreshManualControl();
+      };
+      stickPad.addEventListener("pointerup", release);
+      stickPad.addEventListener("pointercancel", release);
+      stickPad.addEventListener("lostpointercapture", release);
     });
     root.querySelector("[data-manual-neutral]")?.addEventListener("click", () => void neutralizeManualController());
   }
 
   async function dispatchEngineAction(action) {
+    if (ui.manualTakeoverActive) {
+      const now = Date.now();
+      if (now - ui.lastManualBlockLogAt >= 1000) {
+        ui.lastManualBlockLogAt = now;
+        await recordActionFeedback(action, "blocked", "人工接管中，AI 動作未送出。").catch(() => {});
+      }
+      return;
+    }
     if (!runtime.canRouteEngineAction()) return;
     const backend = runtime.state.outputBackend;
     try {
+      let preempted = false;
       if (backend === "mechanical_rig" || backend === "hybrid") await runtime.routeRigAction(action);
       if (backend === "nxbt_bluetooth" || backend === "hybrid") {
-        await api(`/api/projects/${ui.current.manifest.id}/nxbt/action`, { method: "POST", json: action });
+        const result = await api(`/api/projects/${ui.current.manifest.id}/nxbt/action`, { method: "POST", json: action });
+        preempted = Boolean(result.preempted);
       }
-      await recordActionFeedback(action, "executed", "控制後端已完成命令。");
+      await recordActionFeedback(action, preempted ? "blocked" : "executed", preempted ? "人工接管已中止這次 AI 動作。" : "控制後端已完成命令。");
     } catch (error) {
       await recordActionFeedback(action, "failed", error.message).catch(() => {});
       runtime.setControlPaused(true);
@@ -1698,10 +1831,14 @@
     if (!requireProject()) return;
     try {
       if (action === "emergency-stop") {
+        resetManualInputState();
+        ui.manualTakeoverActive = false;
         runtime.setControlPaused(true);
         await emergencyStopOutputs();
       }
       if (action === "pause" || action === "stop") {
+        resetManualInputState();
+        ui.manualTakeoverActive = false;
         runtime.setControlPaused(true);
         await neutralizeOutputs();
       }
@@ -1837,6 +1974,27 @@
     }
   }
 
+  function nxbtTestParameter(operation) {
+    if (operation === "finish_button_test") return "buttons.b=true / 1000 ms";
+    if (!operation.includes(":")) return `buttons.${operation}=true / 120 ms`;
+    const [side, direction] = operation.split(":");
+    const prefix = `${side}_stick`;
+    const values = {
+      prepare: [`${prefix}_x=+100`, "1200 ms"],
+      left: [`${prefix}_x=-100`, "350 ms"],
+      right: [`${prefix}_x=+100`, "350 ms"],
+      up: [`${prefix}_y=+100`, "350 ms"],
+      down: [`${prefix}_y=-100`, "350 ms"]
+    }[direction];
+    return values ? values.join(" / ") : operation;
+  }
+
+  function describeNxbtCommand(command = {}) {
+    const buttons = Object.entries(command.buttons || {}).filter(([, pressed]) => pressed).map(([key]) => `buttons.${key}=true`);
+    const sticks = Object.entries(command.sticks || {}).filter(([, value]) => Number(value) !== 0).map(([key, value]) => `${key}=${Number(value) > 0 ? "+" : ""}${value}`);
+    return [...buttons, ...sticks, `${command.durationMs || 20} ms`].join(" / ");
+  }
+
   function openNxbtInputTest() {
     if (!requireProject()) return;
     const dialog = document.querySelector("#nxbtTestDialog");
@@ -1855,9 +2013,9 @@
         <p>畫面開啟後，按下面任一按鍵。Switch 2 畫面應顯示相同圖示。官方測試畫面不會顯示 HOME、截圖、C、POWER、音量或 SYNC。</p>
         <label class="check-line"><input id="nxbtButtonScreenConfirmed" type="checkbox" ${safeReady ? "" : "disabled"}><strong>我已開啟「測試控制器按鍵」畫面</strong><span>勾選後才會啟用測試按鈕。</span></label>
         <div class="nxbt-input-test-grid">
-          ${nxbtTestButtons.map(([operation, label]) => `<button class="secondary-button" type="button" data-nxbt-test-interface="buttons" data-nxbt-test-operation="${operation}" disabled>${label}</button>`).join("")}
+          ${nxbtTestButtons.map(([operation, label]) => `<button class="secondary-button nxbt-parameter-button" type="button" data-nxbt-test-interface="buttons" data-nxbt-test-operation="${operation}" title="${nxbtTestParameter(operation)}" disabled><span>${label}</span><small>${nxbtTestParameter(operation)}</small></button>`).join("")}
         </div>
-        <div class="step-actions"><button class="secondary-button" type="button" data-nxbt-test-interface="buttons" data-nxbt-test-operation="finish_button_test" disabled>按住 B，結束官方按鍵測試</button></div>
+        <div class="step-actions"><button class="secondary-button nxbt-parameter-button" type="button" data-nxbt-test-interface="buttons" data-nxbt-test-operation="finish_button_test" disabled><span>按住 B，結束官方按鍵測試</span><small>${nxbtTestParameter("finish_button_test")}</small></button></div>
       </section>
 
       <section class="nxbt-test-section" aria-labelledby="nxbtStickTestTitle">
@@ -1870,17 +2028,18 @@
             const sideLabel = side === "left" ? "左搖桿" : "右搖桿";
             return `<div class="nxbt-stick-test" data-stick-panel="${side}">
               <strong>${sideLabel}</strong>
-              <button class="primary-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:prepare" disabled>先選擇${sideLabel}（向右到底）</button>
+              <button class="primary-button nxbt-parameter-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:prepare" disabled><span>先選擇${sideLabel}（向右到底）</span><small>${nxbtTestParameter(`${side}:prepare`)}</small></button>
               <div class="nxbt-stick-directions" aria-label="${sideLabel}方向測試">
-                <button class="secondary-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:up" data-stick-direction="${side}" disabled>↑</button>
-                <button class="secondary-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:left" data-stick-direction="${side}" disabled>←</button>
-                <button class="secondary-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:down" data-stick-direction="${side}" disabled>↓</button>
-                <button class="secondary-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:right" data-stick-direction="${side}" disabled>→</button>
+                <button class="secondary-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:up" data-stick-direction="${side}" title="${nxbtTestParameter(`${side}:up`)}" disabled>↑</button>
+                <button class="secondary-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:left" data-stick-direction="${side}" title="${nxbtTestParameter(`${side}:left`)}" disabled>←</button>
+                <button class="secondary-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:down" data-stick-direction="${side}" title="${nxbtTestParameter(`${side}:down`)}" disabled>↓</button>
+                <button class="secondary-button" type="button" data-nxbt-test-interface="sticks" data-nxbt-test-operation="${side}:right" data-stick-direction="${side}" title="${nxbtTestParameter(`${side}:right`)}" disabled>→</button>
               </div>
               <small data-stick-ready="${side}">尚未先推到底</small>
             </div>`;
           }).join("")}
         </div>
+        <details class="nxbt-parameter-details"><summary>查看 NXBT 實際參數</summary><p>測試路徑直接呼叫 NXBT 原生參數：X 向右為正，Y 向上為正，範圍為 -100 到 +100。網頁人工搖桿採瀏覽器座標（Y 向下為正），bridge 會在送入 NXBT 前反轉一次 Y；畫面與實際方向因此一致。</p></details>
       </section>
       <p class="nxbt-test-status" id="nxbtTestStatus" role="status">${safeReady ? "請先開啟對應的 Switch 2 測試畫面。" : ready ? "等待急停驗證。" : "等待 NXBT 連線。"}</p>
       <div class="dialog-footer"><button class="secondary-button" id="nxbtTestNeutral" type="button" ${ready ? "" : "disabled"}>立即回中立</button></div>
@@ -1937,7 +2096,7 @@
         const readyLabel = dialog.querySelector(`[data-stick-ready='${side}']`);
         if (readyLabel) readyLabel.textContent = "已先推到底，可以測試四個方向";
       }
-      status.textContent = result.message;
+      status.textContent = `${result.message} 實際參數：${describeNxbtCommand(result.command)}。`;
     } catch (error) {
       status.textContent = `測試未送出：${error.message}`;
     } finally {
@@ -2012,6 +2171,8 @@
 
     try {
       stopVisionCapture();
+      resetManualInputState();
+      ui.manualTakeoverActive = false;
       if (ui.current?.manifest?.id) {
         if (runtime.state.engineMode !== "idle") await sendControl("stop");
         else await neutralizeOutputs();
@@ -2062,7 +2223,10 @@
     openProjectDialog, openMonitor, openNxbtInputTest, sendControl, connectNxbt, disconnectNxbt, testNxbtEmergencyStop, saveState, logEvent,
     uploadVideo, startEngine, stopEngine, startVisionCapture, stopVisionCapture, requestVisionCapture, refreshWorkerHealth,
     canaryShadow, rollbackModel, toggleDemonstrationCapture, pretrainDemonstrations, saveControllerOutputSelection,
-    bindTrainingManualControls
+    bindManualControllerControls,
+    bindTrainingManualControls: bindManualControllerControls,
+    releaseManualController: neutralizeManualController,
+    isManualControllerActive: () => manualInputActive() || ui.manualTakeoverActive
   };
   bootstrap();
 })();

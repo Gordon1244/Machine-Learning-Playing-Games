@@ -159,21 +159,29 @@ class BridgeState:
             ),
         }
 
-    def apply_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def apply_action(self, payload: dict[str, Any], preempt: bool = False) -> dict[str, Any]:
         action = normalize_action(payload)
         with self.lock:
             if not self.connected:
                 raise BridgeError(HTTPStatus.CONFLICT, "NXBT controller is not connected.")
+            if preempt:
+                self.action_cancel.set()
+                self.action_cancel = threading.Event()
             session = self.session
             cancel_event = self.action_cancel
+        preempted = False
         if session is not None:
             with self.action_lock:
                 with self.lock:
                     if not self.connected or self.session is not session or cancel_event.is_set():
                         raise BridgeError(HTTPStatus.CONFLICT, "NXBT action was cancelled before execution.")
                 if not session.apply_action(action, cancel_event=cancel_event):
-                    raise BridgeError(HTTPStatus.CONFLICT, "NXBT action was cancelled by emergency stop.")
-        return {"ok": True, "action": action if self.dry_run else None}
+                    with self.lock:
+                        still_connected = self.connected and self.session is session
+                    if not still_connected:
+                        raise BridgeError(HTTPStatus.CONFLICT, "NXBT action was cancelled by emergency stop.")
+                    preempted = True
+        return {"ok": True, "preempted": preempted, "action": action if self.dry_run else None}
 
     def apply_test_input(self, payload: dict[str, Any]) -> dict[str, Any]:
         operation = str(payload.get("operation", "")).strip().lower()
@@ -255,6 +263,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(self.bridge_server.state.disconnect(emergency=True))
             if self.path == "/action":
                 return self.send_json(self.bridge_server.state.apply_action(payload))
+            if self.path == "/manual-action":
+                return self.send_json(self.bridge_server.state.apply_action(payload, preempt=True))
             if self.path == "/test-input":
                 return self.send_json(self.bridge_server.state.apply_test_input(payload))
             raise BridgeError(HTTPStatus.NOT_FOUND, "Bridge route not found.")

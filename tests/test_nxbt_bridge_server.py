@@ -48,6 +48,10 @@ class NxbtBridgeServerTest(unittest.TestCase):
         result = self.request("/action", {"buttons": {"a": True}, "sticks": {"left_stick_x": 999}, "durationMs": 5000})
         self.assertEqual(result["action"]["sticks"]["left_stick_x"], 100)
         self.assertEqual(result["action"]["durationMs"], 1500)
+        manual = self.request("/manual-action", {"buttons": {"a": True, "zr": True}, "sticks": {"left_stick_x": 40}, "durationMs": 100})
+        self.assertTrue(manual["ok"])
+        self.assertTrue(manual["action"]["buttons"]["a"])
+        self.assertTrue(manual["action"]["buttons"]["zr"])
         tested = self.request("/test-input", {
             "operation": "plus",
             "action": {"buttons": {"plus": True}, "sticks": {}, "durationMs": 120},
@@ -126,6 +130,52 @@ class NxbtBridgeServerTest(unittest.TestCase):
         self.assertEqual(action_status, [409])
         self.assertTrue(closed.is_set())
         self.assertTrue(stopped["emergencyStopVerified"])
+
+    def test_manual_action_preempts_ai_action_without_disconnecting(self):
+        started = threading.Event()
+        calls = []
+        ai_result = []
+
+        class InterruptibleSession:
+            def apply_action(self, action, cancel_event=None):
+                calls.append(action)
+                if action["buttons"].get("x"):
+                    started.set()
+                    if cancel_event is not None:
+                        cancel_event.wait(timeout=2)
+                    return not bool(cancel_event and cancel_event.is_set())
+                return True
+
+            def close(self):
+                pass
+
+        state = BridgeState(dry_run=False)
+        state.connected = True
+        state.session = InterruptibleSession()
+        self.server.state = state
+
+        def send_ai_action():
+            ai_result.append(self.request("/action", {"buttons": {"x": True}, "durationMs": 1500}))
+
+        action_thread = threading.Thread(target=send_ai_action, daemon=True)
+        action_thread.start()
+        self.assertTrue(started.wait(timeout=1))
+        before = time.monotonic()
+        manual = self.request("/manual-action", {
+            "buttons": {"a": True, "zr": True},
+            "sticks": {"left_stick_x": 55, "left_stick_y": -30},
+            "durationMs": 100,
+        })
+        action_thread.join(timeout=1)
+
+        self.assertLess(time.monotonic() - before, 0.5)
+        self.assertFalse(action_thread.is_alive())
+        self.assertTrue(ai_result[0]["preempted"])
+        self.assertTrue(manual["ok"])
+        self.assertFalse(manual["preempted"])
+        self.assertTrue(state.connected)
+        self.assertEqual(calls[-1]["sticks"]["left_stick_y"], -30)
+        self.assertTrue(calls[-1]["buttons"]["a"])
 
 
 if __name__ == "__main__":

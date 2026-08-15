@@ -264,6 +264,9 @@ function renderStepList() {
 }
 
 function setActiveStep(stepId) {
+  if (stepId !== state.activeStepId && window.ProjectUI?.isManualControllerActive?.()) {
+    void window.ProjectUI.releaseManualController();
+  }
   state.activeStepId = stepId;
   renderStepList();
   renderActiveStep();
@@ -447,7 +450,7 @@ function renderTraining() {
       <div class="metric"><span class="status-label">最近狀態</span><strong>${state.trainingEngineReady ? (state.needsRecalibration ? "需校正" : "待訓練") : "引擎不可用"}</strong><p>${state.trainingEngineReady ? "引擎已接入，等待真實訓練資料" : escapeHtml(state.engineStatusMessage)}</p></div>
       <div class="metric"><span class="status-label">控制器示範</span><strong>${state.demonstrationRecording ? "錄製中" : "待命"}</strong><p>同步保存鏡頭與電腦 Gamepad 操作</p></div>
     </div>
-    ${renderManualController()}
+    ${renderManualController("preflight")}
     <div class="step-actions">
       <button class="secondary-button" data-action="toggle-demonstration" type="button">${state.demonstrationRecording ? "停止示範錄製" : "錄製我的操作示範"}</button>
       <button class="secondary-button" data-action="pretrain-demonstrations" type="button" ${state.demonstrationRecording ? "disabled" : ""}>用示範暖身 AI</button>
@@ -459,14 +462,16 @@ function renderTraining() {
   `;
 }
 
-function renderManualController() {
-  const manual = getManualControllerReadiness();
+function renderManualController(mode = "preflight") {
+  const liveTakeover = mode === "live";
+  const manual = getManualControllerReadiness(mode);
   const manualReady = manual.ok;
+  const titleId = `manualControllerTitle-${mode}`;
   const button = (input, label, className = "") => `<button class="manual-control-button ${className}" type="button" data-manual-button="${input}" ${manualReady ? "" : "disabled"}>${label}</button>`;
   return `
-    <section class="manual-controller-panel" aria-labelledby="manualControllerTitle">
+    <section class="manual-controller-panel" data-manual-controller-mode="${mode}" aria-labelledby="${titleId}">
       <div class="manual-controller-heading">
-        <div><h3 id="manualControllerTitle">人工控制手把</h3><p>只在訓練停止時使用，可先進入比賽或完成前置畫面。HOME 與截圖鍵永遠不開放。</p></div>
+        <div><h3 id="${titleId}">${liveTakeover ? "正式遊玩人工接管" : "人工控制手把"}</h3><p>${liveTakeover ? "人工輸入期間會暫時阻止 AI 動作；全部放開並確認回中立後，才交還 AI。" : "只在訓練停止時使用，可先進入比賽或完成前置畫面。"} HOME 與截圖鍵永遠不開放。</p></div>
         <button class="secondary-button" type="button" data-manual-neutral ${manualReady ? "" : "disabled"}>立即回中立</button>
       </div>
       <div class="manual-controller-layout">
@@ -500,16 +505,24 @@ function renderManualController() {
           ${button("right_stick_press", "按下 RS")}
         </div>
       </div>
-      <p class="manual-control-status" id="manualControlStatus" role="status">${manualReady ? "可操作。按住按鍵或拖曳搖桿，放開後會自動回中立。" : escapeHtml(manual.message)}</p>
+      <label class="manual-latch-option"><input type="checkbox" data-manual-latch ${manualReady ? "" : "disabled"}> 滑鼠點按鎖定按鍵</label>
+      <p class="manual-control-hint">需要一邊加速一邊轉向時，可勾選後點一下加速鍵，再拖曳搖桿；完成後按「立即回中立」。觸控操作可直接同時按住。</p>
+      <p class="manual-control-status" data-manual-control-status role="status">${manualReady ? (liveTakeover ? "正式遊玩已啟動時可接管；目前沒有人工輸入。" : "可操作。按住按鍵或拖曳搖桿，放開後會自動回中立。") : escapeHtml(manual.message)}</p>
     </section>
   `;
 }
 
-function getManualControllerReadiness() {
-  if (state.engineMode !== "idle" || state.controlPaused) return { ok: false, message: "請先停止訓練或正式遊玩，才可人工操作。" };
+function getManualControllerReadiness(mode = "preflight") {
+  if (mode === "live") {
+    if (state.engineMode !== "live") return { ok: false, message: "請先按「開始正式遊玩」，引擎啟動後才可人工接管。" };
+    if (state.controlPaused) return { ok: false, message: "目前已暫停。請先繼續正式遊玩，再使用人工接管。" };
+    if (!getCurrentSafetyGate().ok || !state.liveEngineReady) return { ok: false, message: "正式遊玩的安全閘門或本地引擎未就緒，不能人工接管。" };
+  } else if (state.engineMode !== "idle" || state.controlPaused) {
+    return { ok: false, message: "請先停止訓練或正式遊玩，才可人工操作。" };
+  }
   if (!state.emergencyStopOk) return { ok: false, message: "請先完成急停測試，才可人工操作。" };
   const backend = OUTPUT_BACKEND_PROFILES[state.outputBackend];
-  if (backend.requiresRigCalibration && !canRouteManualPreflight()) {
+  if (backend.requiresRigCalibration && (mode === "live" ? !getCurrentSafetyGate().ok : !canRouteManualPreflight())) {
     return { ok: false, message: "請先連接開發板、確認外部電源並完成手把校正。" };
   }
   if (backend.requiresNxbt && !state.nxbtReady) return { ok: false, message: "請先連接 NXBT 控制器。" };
@@ -551,6 +564,7 @@ function renderLivePlay() {
       <div class="metric"><span class="status-label">安全閘門</span><strong>${safety.ok ? "通過" : "未通過"}</strong><p>${safety.nextStep}</p></div>
     </div>
     ${safety.ok ? "" : `<div class="alert">${safety.issues.map(escapeHtml).join("<br>")}</div>`}
+    ${renderManualController("live")}
     <div class="step-actions">
       <button class="primary-button" data-action="start-live" type="button" ${safety.ok && state.liveEngineReady && state.modelReady ? "" : "disabled"}>開始正式遊玩</button>
       <button class="secondary-button" data-action="canary-shadow" type="button" ${state.shadowReady && state.liveEngineReady ? "" : "disabled"}>試跑備用 AI</button>
@@ -664,7 +678,7 @@ function bindStepEvents(stepId) {
     updateScreenCornerOverlay();
     if (state.cameraStream && !state.cameraOpening) attachCameraPreview();
   }
-  if (stepId === "training") window.ProjectUI?.bindTrainingManualControls(stepContent);
+  if (["training", "live_play"].includes(stepId)) window.ProjectUI?.bindManualControllerControls(stepContent);
 }
 
 async function handleAction(action) {
@@ -1392,7 +1406,7 @@ function setEngineRuntimeStatus(status = {}) {
   if (status.activeGuidance) state.trainingGuidance = status.activeGuidance;
   const current = `${state.trainingEngineReady}:${state.liveEngineReady}:${state.modelReady}:${state.shadowReady}:${state.engineStatusMessage}`;
   if (current !== previous) {
-    renderActiveStep();
+    if (!window.ProjectUI?.isManualControllerActive?.()) renderActiveStep();
     updateStatus();
   }
 }

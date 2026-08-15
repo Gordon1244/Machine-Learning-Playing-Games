@@ -377,6 +377,8 @@ test("UI source does not expose fake hardware or fake training success paths", (
   assert.equal(appSource.includes('data-action="manual-screen-corners"'), true);
   assert.equal(appSource.includes('data-manual-stick="left"'), true);
   assert.equal(appSource.includes('data-manual-button="${input}"'), true);
+  assert.equal(appSource.includes('renderManualController("live")'), true);
+  assert.equal(appSource.includes("正式遊玩人工接管"), true);
   assert.equal(appSource.includes("manualPreflight"), true);
   assert.equal(appSource.includes('tooltip.setAttribute("popover", "manual")'), true);
   assert.equal(stylesSource.includes(".camera-empty[hidden]"), true);
@@ -483,6 +485,13 @@ test("NXBT input test requires official screens and stick preparation", () => {
   assert(source.includes("控制器與周邊設備 → 校正控制搖桿"));
   assert(source.includes("先選擇${sideLabel}（向右到底）"));
   assert(source.includes("finish_button_test"));
+  assert(source.includes("NXBT 實際參數"));
+  assert(source.includes("_y=+100"));
+  assert(source.includes("bridge 會在送入 NXBT 前反轉一次 Y"));
+  assert(source.includes("manualHeldButtons"));
+  assert(source.includes("manualTakeoverActive"));
+  assert(source.includes("人工接管中，AI 動作未送出"));
+  assert(source.includes("bindManualControllerControls"));
   assert(source.includes("HOME、截圖、C、GL、GR"));
   assert(source.includes("syncControllerBackendCompatibility"));
   assert(source.includes("NXBT 只能使用 Switch 2 Pro 手把"));

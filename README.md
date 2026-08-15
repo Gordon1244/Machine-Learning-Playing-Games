@@ -316,9 +316,13 @@ NXBT 連線且軟體急停測試完成後，到網頁的「完整手把校正」
 
 搖桿測試前，先在 Switch 2 開啟：`HOME 選單 → 主機設定 → 控制器與周邊設備 → 校正控制搖桿`。依 Nintendo 官方流程，必須先把要測試的搖桿向任一方向推到底並保持幾秒，主機才會選中該搖桿。因此網頁會強制先按 `先選擇左搖桿` 或 `先選擇右搖桿`，將該搖桿向右推到底約 1.2 秒；完成後才會開放上下左右測試。若 Switch 2 尚未選中搖桿，再按一次選擇按鈕，然後依主機畫面提示檢查。[Nintendo Switch 2 搖桿校正說明](https://en-americas-support.nintendo.com/app/answers/detail/a_id/68192/)
 
+測試視窗會在每個按鍵旁顯示實際送出的 NXBT 參數與持續時間。NXBT 原生搖桿座標為 X 向右正、Y 向上正，範圍 `-100..100`；網頁人工搖桿採瀏覽器座標（Y 向下正），bridge 只在送進 NXBT 前反轉一次 Y，因此拖曳方向與 Switch 2 畫面方向一致。
+
+正式遊玩啟動後，頁面會開放「正式遊玩人工接管」。人工輸入會先阻止新的 AI 動作，最新版 bridge 的 `/manual-action` 也會中止正在執行的 AI NXBT 動作，再送人工封包。按鍵與雙搖桿可同時組合；只有滑鼠時可勾選「滑鼠點按鎖定按鍵」，先鎖定加速鍵再拖曳搖桿。全部放開或按「立即回中立」並收到中立確認後，才把控制交還 AI。切換視窗、隱藏分頁、暫停、停止與結束程式都會清除人工輸入並要求回中立。
+
 token 只保留在 localhost 後端記憶體，不會寫入專案、快照、匯出檔或日志。只在可信任的私人網路開放 bridge，並確認 VM 防火牆允許 TCP `8766`。
 
-HTTP VM bridge 提供 `/health`、`/connect`、`/disconnect`、`/emergency-stop`、`/action` 與 `/test-input`；localhost 後端以 `/nxbt/test-input` 執行白名單測試。所有 bridge 路徑都需要 Bearer token。本機網頁後端只接受 `localhost` 或私人 IPv4，避免把 token 送到公開位址。
+HTTP VM bridge 提供 `/health`、`/connect`、`/disconnect`、`/emergency-stop`、`/action`、`/manual-action` 與 `/test-input`；localhost 後端以 `/nxbt/test-input` 執行白名單測試。`/manual-action` 會先中止當前 AI 動作並回中立，再執行人工接管輸入；急停仍會直接移除模擬控制器。所有 bridge 路徑都需要 Bearer token。本機網頁後端只接受 `localhost` 或私人 IPv4，避免把 token 送到公開位址。
 
 進階診斷時可以在宿主機的 `nxbt` 資料夾執行 `vagrant ssh -c "hostname -I"` 查詢 VM 網路位址。但 VirtualBox 預設顯示的 `10.0.2.15` 通常是 NAT 位址，Windows 與 macOS 一般流程不要將它填入網頁。
 

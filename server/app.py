@@ -1586,7 +1586,7 @@ class Handler(SimpleHTTPRequestHandler):
             if parts == ["api", "health"]:
                 return self.send_json({"ok": True, "service": "switch2-ai-local"})
             if parts == ["api", "bootstrap"]:
-                return self.send_json({"token": SESSION_TOKEN, "settings": STORE.app_settings(), "projects": STORE.list_projects(), "capabilities": STORE.capabilities()})
+                return self.send_json({"token": SESSION_TOKEN, "settings": STORE.app_settings(), "projects": STORE.list_projects()})
             if parts == ["api", "capabilities"]:
                 return self.send_json(STORE.capabilities())
             if parts == ["api", "dependencies"]:

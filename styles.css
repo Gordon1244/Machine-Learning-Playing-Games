@@ -49,9 +49,9 @@ button {
 }
 
 .topbar {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(240px, auto) minmax(0, 1fr) auto;
   align-items: center;
-  justify-content: space-between;
   gap: 16px;
   margin-bottom: 22px;
 }
@@ -153,7 +153,15 @@ button {
 }
 
 .product-tools {
-  margin-left: auto;
+  min-width: 0;
+}
+
+#emergencyStopButton {
+  flex: 0 0 auto;
+  justify-content: center;
+  min-width: 96px;
+  white-space: nowrap;
+  word-break: keep-all;
 }
 
 .engine-badge {
@@ -300,6 +308,7 @@ h3 {
 }
 
 .stop-icon {
+  flex: 0 0 14px;
   width: 14px;
   height: 14px;
   border-radius: 50%;
@@ -1261,6 +1270,10 @@ h3 {
 }
 
 @media (max-width: 860px) {
+  .topbar {
+    display: flex;
+  }
+
   .topbar,
   .panel-header {
     flex-direction: column;
@@ -1288,6 +1301,10 @@ h3 {
 
   .product-tools {
     margin-left: 0;
+  }
+
+  #emergencyStopButton {
+    align-self: flex-start;
   }
 
   .manual-controller-layout {

@@ -465,11 +465,17 @@ test("product UI includes persistent projects, snapshots, logs, and realtime mon
 
 test("startup always presents the project selector after optional project restore", () => {
   const source = fs.readFileSync("src/product-ui.js", "utf8");
+  const styles = fs.readFileSync("styles.css", "utf8");
   const bootstrapBlock = source.slice(source.indexOf("async function bootstrap()"), source.indexOf("function updateEngineBadge()"));
-  assert(bootstrapBlock.includes("await loadProject(lastId)"));
-  assert(bootstrapBlock.includes("await openProjectDialog()"));
-  assert(bootstrapBlock.indexOf("await openProjectDialog()") > bootstrapBlock.indexOf("await loadProject(lastId)"));
+  assert(bootstrapBlock.includes("await openProjectDialog({ refresh: false })"));
+  assert(bootstrapBlock.includes("void hydrateStartup(lastId)"));
+  assert(bootstrapBlock.indexOf("await openProjectDialog({ refresh: false })") < bootstrapBlock.indexOf("void hydrateStartup(lastId)"));
+  assert(bootstrapBlock.includes("await loadProject(lastId, { deferWorkerHealth: true })"));
   assert(bootstrapBlock.includes("無法恢復上次專案"));
+  assert(source.includes("projectLoadSequence"));
+  assert(styles.includes("#emergencyStopButton"));
+  assert(styles.includes("white-space: nowrap"));
+  assert(styles.includes("word-break: keep-all"));
 });
 
 test("optional assistant keeps offline guidance and menu workflows available", () => {

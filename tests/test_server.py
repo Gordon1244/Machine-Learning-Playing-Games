@@ -461,6 +461,13 @@ class ApiTest(StoreTest):
     def test_local_server_disallows_duplicate_port_binding(self):
         self.assertFalse(app.LocalThreadingHTTPServer.allow_reuse_address)
 
+    def test_bootstrap_does_not_wait_for_worker_or_hardware_capability_probe(self):
+        self.store.capabilities = lambda: self.fail("bootstrap must not run the slow capability probe")
+        status, result = self.request("GET", "/api/bootstrap")
+        self.assertEqual(status, 200)
+        self.assertIn("projects", result)
+        self.assertNotIn("capabilities", result)
+
     def setUp(self):
         super().setUp()
         self.server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)

@@ -197,7 +197,8 @@
     lastManualBlockLogAt: 0,
     shuttingDown: false,
     menuTeaching: null,
-    menuTaskRunning: false
+    menuTaskRunning: false,
+    projectLoadSequence: 0
   };
 
   function esc(value) {
@@ -288,21 +289,10 @@
       const data = await api("/api/bootstrap");
       ui.token = data.token;
       ui.projects = data.projects;
-      ui.capabilities = data.capabilities;
+      ui.capabilities = null;
       createShell();
-      updateEngineBadge();
+      await openProjectDialog({ refresh: false });
       const lastId = data.settings?.lastProjectId;
-      if (lastId && ui.projects.some((item) => item.id === lastId)) {
-        try {
-          await loadProject(lastId);
-        } catch (error) {
-          ui.current = null;
-          ui.settings = null;
-          updateProjectButton();
-          runtime.showToast(`無法恢復上次專案：${error.message}。請重新選擇專案。`);
-        }
-      }
-      await openProjectDialog();
       window.setInterval(() => saveState("five_minute_autosave"), 5 * 60 * 1000);
       window.addEventListener("switch2-state-change", scheduleSave);
       window.addEventListener("beforeunload", () => saveState("window_close", true));
@@ -312,8 +302,35 @@
       document.addEventListener("visibilitychange", () => {
         if (document.hidden && (manualInputActive() || ui.manualTakeoverActive)) void neutralizeManualController();
       });
+      void hydrateStartup(lastId);
     } catch (error) {
       runtime.showToast(`本機後端尚未啟動：${error.message}`);
+    }
+  }
+
+  async function hydrateStartup(lastId) {
+    if (lastId && ui.projects.some((item) => item.id === lastId)) {
+      try {
+        await loadProject(lastId, { deferWorkerHealth: true });
+      } catch (error) {
+        if (!ui.current || ui.current.manifest?.id === lastId) {
+          ui.current = null;
+          ui.settings = null;
+          updateProjectButton();
+        }
+        runtime.showToast(`無法恢復上次專案：${error.message}。請重新選擇專案。`);
+      }
+    }
+    const dialog = document.querySelector("#projectDialog");
+    if (dialog?.open) await openProjectDialog();
+    try {
+      ui.capabilities = await api("/api/capabilities");
+      updateEngineBadge();
+      if (ui.current) await refreshWorkerHealth();
+    } catch (error) {
+      const badge = document.querySelector("#engineAvailability");
+      if (badge) badge.textContent = "真實引擎：檢查失敗";
+      runtime.showToast(`本地引擎狀態檢查失敗：${error.message}。核心設定仍可使用。`);
     }
   }
 
@@ -336,7 +353,10 @@
   function openChipDetection() {
     const dialog = document.querySelector("#chipDialog");
     const capabilities = ui.capabilities;
-    if (!capabilities) return;
+    if (!capabilities) {
+      runtime.showToast("晶片與本地引擎仍在背景檢查，請稍後再開啟。");
+      return;
+    }
     dialog.innerHTML = `
       ${dialogHeader("晶片偵測", "實際晶片與可用執行環境分開顯示。偵測到晶片不代表驅動或訓練套件已經可以使用。")}
       <div class="chip-summary">
@@ -401,24 +421,29 @@
     if (button) button.textContent = `專案：${ui.current?.manifest?.name || "尚未選擇"}`;
   }
 
-  async function loadProject(id) {
+  async function loadProject(id, options = {}) {
+    const loadSequence = ++ui.projectLoadSequence;
     ui.menuTeaching = null;
     ui.menuTaskRunning = false;
     stopVisionCapture();
     const project = await api(`/api/projects/${encodeURIComponent(id)}/open`, { method: "POST", json: {} });
+    if (loadSequence !== ui.projectLoadSequence) return null;
     ui.current = project;
     ui.settings = project.settings;
     await runtime.loadPersistentState(project.manifest.id, project.state);
+    if (loadSequence !== ui.projectLoadSequence) return null;
     runtime.applyEffectiveSettings(project.settings.effective, { preserveSelections: true });
     const guidance = await api(`/api/projects/${project.manifest.id}/training-guidance`);
+    if (loadSequence !== ui.projectLoadSequence) return null;
     runtime.setTrainingGuidance(guidance.guidance.slice().reverse().find((item) => ["active", "scheduled"].includes(item.status)) || null);
-    await refreshWorkerHealth();
     updateProjectButton();
+    if (!options.deferWorkerHealth) await refreshWorkerHealth();
     runtime.showToast(`已開啟專案：${project.manifest.name}。鏡頭、開發板、急停與 NXBT 請重新驗證。`);
+    return project;
   }
 
-  async function openProjectDialog() {
-    await refreshProjects();
+  async function openProjectDialog(options = {}) {
+    if (options?.refresh !== false) await refreshProjects();
     const dialog = document.querySelector("#projectDialog");
     dialog.innerHTML = `
       ${dialogHeader("遊戲專案", "每個遊戲分開保存設定、訓練進度、快照與日志。")}

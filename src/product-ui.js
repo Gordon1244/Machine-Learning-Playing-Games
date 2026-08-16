@@ -293,11 +293,16 @@
       updateEngineBadge();
       const lastId = data.settings?.lastProjectId;
       if (lastId && ui.projects.some((item) => item.id === lastId)) {
-        await loadProject(lastId);
-      } else {
-        await refreshProjects();
-        openProjectDialog();
+        try {
+          await loadProject(lastId);
+        } catch (error) {
+          ui.current = null;
+          ui.settings = null;
+          updateProjectButton();
+          runtime.showToast(`無法恢復上次專案：${error.message}。請重新選擇專案。`);
+        }
       }
+      await openProjectDialog();
       window.setInterval(() => saveState("five_minute_autosave"), 5 * 60 * 1000);
       window.addEventListener("switch2-state-change", scheduleSave);
       window.addEventListener("beforeunload", () => saveState("window_close", true));

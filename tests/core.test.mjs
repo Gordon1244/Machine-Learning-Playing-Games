@@ -331,6 +331,7 @@ test("live learning supports multiple selected modes and rollback logic", () => 
 
 test("UI source does not expose fake hardware or fake training success paths", () => {
   const appSource = fs.readFileSync("src/app.js", "utf8");
+  const productSource = fs.readFileSync("src/product-ui.js", "utf8");
   const stylesSource = fs.readFileSync("styles.css", "utf8");
 
   assert.equal(appSource.includes("connectionOk: true"), false);
@@ -375,6 +376,13 @@ test("UI source does not expose fake hardware or fake training success paths", (
   assert.equal(appSource.includes("4 條邊與框內內容已檢查"), true);
   assert.equal(appSource.includes('overlay.toggleAttribute("hidden", !showScreenCorners)'), true);
   assert.equal(appSource.includes('data-action="manual-screen-corners"'), true);
+  assert.equal(appSource.includes('data-action="manual-screen-finish"'), true);
+  assert.equal(appSource.includes('screenManualPhase: "off"'), true);
+  assert.equal(appSource.includes('screenManualPhase === "adjusting"'), true);
+  assert.equal(appSource.includes("四角移動完成，開始驗證"), true);
+  assert.equal(appSource.includes("自動辨識已暫停"), true);
+  assert.equal(productSource.includes('runtime.state.screenManualPhase === "adjusting"'), true);
+  assert.equal(productSource.includes("cameraVerificationId !== runtime.state.cameraVerificationId"), true);
   assert.equal(appSource.includes('data-manual-stick="left"'), true);
   assert.equal(appSource.includes('data-manual-button="${input}"'), true);
   assert.equal(appSource.includes('renderManualController("live")'), true);

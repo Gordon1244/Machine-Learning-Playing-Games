@@ -55,6 +55,7 @@ const state = {
   ],
   screenCornerSource: "none",
   screenCornersManual: false,
+  screenManualPhase: "off",
   serialPort: null,
   trainingSeconds: 0,
   bestScore: 0,
@@ -360,9 +361,14 @@ function renderCameraCalibration() {
   const cameraStatus = state.cameraConnected ? "已授權" : "未開啟";
   const previewStatus = state.cameraReady ? "已顯示" : "未顯示";
   const calibrationStatus = state.cameraCalibrated ? "已確認" : "未確認";
-  const screenStatus = state.screenDetected ? "已框住" : state.cameraReady ? "偵測中" : "等待鏡頭";
+  const screenStatus = getScreenDetectionStatus();
   const screenNote = getScreenDetectionNote();
   const showScreenCorners = shouldShowScreenCorners();
+  const manualFinishLabel = state.screenDetected
+    ? "手動四角已通過驗證"
+    : state.screenManualPhase === "verifying"
+      ? `正在驗證手動四角 ${state.screenVerificationFrames}/${state.screenVerificationRequired}`
+      : "四角移動完成，開始驗證";
   return `
     <p class="step-copy">把攝影機對準 Switch 2 螢幕或掌機畫面。系統必須真的取得鏡頭畫面後，才允許你確認校正。${helpIcon("cameraCalibration", "鏡頭校正說明")}</p>
     ${window.isSecureContext ? "" : `<div class="alert">目前不是安全的瀏覽器環境，鏡頭預覽可能無法播放。請改用 <strong>http://localhost:8765</strong> 開啟。</div>`}
@@ -385,8 +391,9 @@ function renderCameraCalibration() {
       <button class="secondary-button" id="cameraOpenButton" data-action="open-camera" type="button" ${state.cameraOpening ? "disabled" : ""}>${state.cameraOpening ? "正在開啟..." : "開啟鏡頭"}</button>
       <button class="secondary-button" id="cameraCloseButton" data-action="close-camera" type="button" ${state.cameraConnected || state.cameraOpening ? "" : "disabled"}>關閉鏡頭</button>
       <button class="secondary-button" id="screenAutoDetectButton" data-action="redetect-screen" type="button" ${state.cameraReady ? "" : "disabled"}>重新自動偵測四角</button>
-      <button class="secondary-button" data-action="manual-screen-corners" type="button" ${state.cameraReady ? "" : "disabled"}>手動設定四角</button>
-      <button class="primary-button" id="cameraConfirmButton" data-action="complete-step" type="button" ${state.cameraReady && state.screenDetected ? "" : "disabled"}>我確認四角正確</button>
+      <button class="secondary-button" data-action="manual-screen-corners" type="button" ${state.cameraReady ? "" : "disabled"}>${state.screenCornersManual ? "重新調整四角" : "手動設定四角"}</button>
+      ${state.screenCornersManual ? `<button class="secondary-button" id="manualScreenFinishButton" data-action="manual-screen-finish" type="button" ${state.screenManualPhase === "adjusting" ? "" : "disabled"}>${manualFinishLabel}</button>` : ""}
+      <button class="primary-button" id="cameraConfirmButton" data-action="complete-step" type="button" ${state.cameraReady ? "" : "disabled"}>我確認畫面正確，繼續</button>
       <button class="secondary-button" data-action="camera-tip" type="button">我看不到畫面</button>
     </div>
   `;
@@ -734,18 +741,27 @@ async function handleAction(action) {
   }
 
   if (action === "manual-screen-corners") {
-    state.screenCorners = [
-      { x: 0.06, y: 0.08 }, { x: 0.94, y: 0.08 },
-      { x: 0.94, y: 0.92 }, { x: 0.06, y: 0.92 }
-    ];
+    resetScreenEvidence("自動辨識已暫停。請移動四個角，完成後再按「四角移動完成，開始驗證」。");
     state.screenCornersManual = true;
+    state.screenManualPhase = "adjusting";
     state.cameraVerificationId = newCameraVerificationId();
-    clearScreenVerification("手動四角只是候選範圍，仍需檢查真實外框、框內內容與連續三張穩定畫面。");
     state.screenCornerSource = "manual";
     updateScreenCornerOverlay();
-    showToast("已顯示手動控制點；請把四個角移到真正螢幕外框，這不代表已通過驗證。");
+    window.ProjectUI?.logEvent("screen_manual_adjustment_started", {});
+    showToast("已暫停自動辨識。請先移動四角，完成後按「四角移動完成，開始驗證」。");
+  }
+
+  if (action === "manual-screen-finish") {
+    if (!state.screenCornersManual || state.screenManualPhase !== "adjusting") return;
+    resetScreenEvidence("已鎖定你設定的四角，正在驗證邊線、形狀、比例與框內內容；驗證不會移動四角。");
+    state.screenCornersManual = true;
+    state.screenManualPhase = "verifying";
+    state.screenCornerSource = "manual";
+    state.cameraVerificationId = newCameraVerificationId();
+    updateScreenCornerOverlay();
+    window.ProjectUI?.logEvent("screen_manual_adjustment_finished", { corners: state.screenCorners });
+    showToast("四角已鎖定，開始驗證。驗證期間不會自動尋找或移動四角。");
     await window.ProjectUI?.requestVisionCapture();
-    return;
   }
 
   if (action === "start-training") {
@@ -835,7 +851,13 @@ function validateCurrentStepBeforeComplete() {
 
   if (state.activeStepId === "camera_calibration") {
     if (!state.cameraReady) return { ok: false, message: "沒有真實鏡頭畫面，不能標記鏡頭已校正。" };
-    if (!state.screenDetected) return { ok: false, message: "尚未可靠偵測螢幕四角。請重新自動偵測，或拖曳四個角到螢幕邊緣後等待驗證。" };
+    if (state.screenCornersManual && state.screenManualPhase === "adjusting") {
+      return { ok: false, message: "請先完成四角移動，再按「四角移動完成，開始驗證」。手動調整期間自動辨識已暫停。" };
+    }
+    if (state.screenCornersManual && state.screenManualPhase === "verifying") {
+      return { ok: false, message: `手動四角仍在驗證 ${state.screenVerificationFrames}/${state.screenVerificationRequired}，請保持鏡頭不動。` };
+    }
+    if (!state.screenDetected) return { ok: false, message: `畫面範圍尚未通過驗證：${getScreenDetectionNote()}` };
   }
 
   if (state.activeStepId === "rig_calibration") {
@@ -977,7 +999,16 @@ function refreshCameraCalibrationView() {
   const previewNote = document.querySelector("#cameraPreviewNote");
   if (previewNote) previewNote.textContent = state.cameraReady ? "正在播放真實鏡頭畫面" : "還沒有可確認的影像";
   const confirmButton = document.querySelector("#cameraConfirmButton");
-  if (confirmButton) confirmButton.disabled = !state.cameraReady || !state.screenDetected;
+  if (confirmButton) confirmButton.disabled = !state.cameraReady;
+  const manualFinishButton = document.querySelector("#manualScreenFinishButton");
+  if (manualFinishButton) {
+    manualFinishButton.disabled = state.screenManualPhase !== "adjusting";
+    manualFinishButton.textContent = state.screenDetected
+      ? "手動四角已通過驗證"
+      : state.screenManualPhase === "verifying"
+        ? `正在驗證手動四角 ${state.screenVerificationFrames}/${state.screenVerificationRequired}`
+        : "四角移動完成，開始驗證";
+  }
   const autoDetectButton = document.querySelector("#screenAutoDetectButton");
   if (autoDetectButton) autoDetectButton.disabled = !state.cameraReady;
   const openButton = document.querySelector("#cameraOpenButton");
@@ -1075,7 +1106,7 @@ function newCameraVerificationId() {
   return window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-function clearScreenVerification(message = "") {
+function resetScreenEvidence(message = "") {
   state.screenDetected = false;
   state.screenCandidatePassed = false;
   state.screenConfidence = 0;
@@ -1083,7 +1114,20 @@ function clearScreenVerification(message = "") {
   state.screenVerificationFrames = 0;
   state.screenVerificationRequired = 3;
   state.screenDetectionMessage = message;
-  state.screenCornerSource = "none";
+}
+
+function clearScreenVerification(message = "") {
+  resetScreenEvidence(message);
+  state.screenCornerSource = state.screenCornersManual ? "manual" : "none";
+  state.screenManualPhase = state.screenCornersManual ? "adjusting" : "off";
+}
+
+function getScreenDetectionStatus() {
+  if (state.screenDetected) return "已框住";
+  if (!state.cameraReady) return "等待鏡頭";
+  if (state.screenCornersManual && state.screenManualPhase === "adjusting") return "等待移動完成";
+  if (state.screenCornersManual && state.screenManualPhase === "verifying") return "驗證中";
+  return "偵測中";
 }
 
 function getScreenDetectionNote() {
@@ -1091,8 +1135,15 @@ function getScreenDetectionNote() {
     return `${state.screenCornersManual ? "手動四角已驗證" : "自動四角已驗證"}，信心 ${Math.round(state.screenConfidence * 100)}%，4 條邊與框內內容已檢查`;
   }
   if (!state.cameraReady) return "開啟鏡頭後才會精準檢查四條邊與框內內容";
+  if (state.screenCornersManual && state.screenManualPhase === "adjusting") {
+    return "自動辨識已暫停。移動四角後，請按「四角移動完成，開始驗證」。";
+  }
   if (state.screenVerificationFrames > 0) {
     return `單張畫面已通過，正在確認位置穩定 ${state.screenVerificationFrames}/${state.screenVerificationRequired}；請保持鏡頭不動`;
+  }
+  if (state.screenEvidence?.geometryPassed === false) {
+    const ratio = Number(state.screenEvidence?.aspectRatio);
+    return `四條邊與框內內容已找到，但四角形狀、範圍或比例尚未通過${Number.isFinite(ratio) ? `（目前比例 ${ratio.toFixed(2)}）` : ""}。請按「重新調整四角」修正。`;
   }
   const supportedEdges = Number(state.screenEvidence?.supportedEdges);
   if (Number.isFinite(supportedEdges)) {
@@ -1123,10 +1174,10 @@ function updateScreenCornerOverlay() {
     handle.style.setProperty("--corner-x", String(corner.x));
     handle.style.setProperty("--corner-y", String(corner.y));
     handle.hidden = !showScreenCorners;
-    handle.disabled = !state.cameraReady;
+    handle.disabled = !state.cameraReady || (state.screenCornersManual && state.screenManualPhase !== "adjusting");
   });
   const status = document.querySelector("#screenDetectionStatus");
-  if (status) status.textContent = state.screenDetected ? "已框住" : state.cameraReady ? "等待驗證" : "等待鏡頭";
+  if (status) status.textContent = getScreenDetectionStatus();
   const note = document.querySelector("#screenDetectionNote");
   if (note) note.textContent = getScreenDetectionNote();
 }
@@ -1140,6 +1191,10 @@ function bindScreenCornerControls() {
       event.preventDefault();
       const index = Number(handle.dataset.screenCorner);
       state.cameraVerificationId = newCameraVerificationId();
+      state.screenCornersManual = true;
+      state.screenManualPhase = "adjusting";
+      state.screenCornerSource = "manual";
+      resetScreenEvidence("四角已移動。完成全部調整後，請按「四角移動完成，開始驗證」。");
       handle.setPointerCapture(event.pointerId);
       const move = (pointerEvent) => {
         const box = frame.getBoundingClientRect();
@@ -1148,13 +1203,7 @@ function bindScreenCornerControls() {
           x: Math.min(0.995, Math.max(0.005, (pointerEvent.clientX - box.left) / box.width)),
           y: Math.min(0.995, Math.max(0.005, (pointerEvent.clientY - box.top) / box.height))
         };
-        state.screenCornersManual = true;
-        state.screenDetected = false;
-        state.screenCandidatePassed = false;
-        state.screenConfidence = 0;
-        state.screenEvidence = null;
-        state.screenVerificationFrames = 0;
-        state.screenDetectionMessage = "四角已移動，正在重新檢查真實邊界與框內內容。";
+        resetScreenEvidence("四角已移動。完成全部調整後，請按「四角移動完成，開始驗證」。");
         state.cameraCalibrated = false;
         updateScreenCornerOverlay();
       };
@@ -1163,7 +1212,7 @@ function bindScreenCornerControls() {
         handle.removeEventListener("pointerup", finish);
         handle.removeEventListener("pointercancel", finish);
         emitStateChange();
-        await window.ProjectUI?.requestVisionCapture();
+        showToast("角點位置已保存。全部移動完成後，請按「四角移動完成，開始驗證」。");
       };
       handle.addEventListener("pointermove", move);
       handle.addEventListener("pointerup", finish, { once: true });
@@ -1420,7 +1469,7 @@ function setLatestGameState(gameState = {}) {
   state.latestGameState = gameState;
   if (Number.isFinite(Number(gameState.learningScore))) state.currentScore = Number(gameState.learningScore);
   if (state.currentScore > state.bestScore) state.bestScore = state.currentScore;
-  if (validScreenCorners(gameState.screenCorners)) {
+  if (!state.screenCornersManual && validScreenCorners(gameState.screenCorners)) {
     state.screenCorners = gameState.screenCorners.map((point) => ({
       x: Math.min(1, Math.max(0, Number(point.x))),
       y: Math.min(1, Math.max(0, Number(point.y)))
@@ -1435,6 +1484,7 @@ function setLatestGameState(gameState = {}) {
   if (typeof gameState.message === "string") state.screenDetectionMessage = gameState.message;
   if (gameState.ready !== undefined) {
     state.screenDetected = Boolean(gameState.ready);
+    if (state.screenDetected && state.screenCornersManual) state.screenManualPhase = "verified";
     state.needsRecalibration = !state.screenDetected;
     if (!state.screenDetected) state.cameraCalibrated = false;
   }
@@ -1598,6 +1648,14 @@ async function loadPersistentState(projectId, saved = {}) {
     state.screenCorners = saved.screenCorners.map((point) => ({ x: Number(point.x), y: Number(point.y) }));
   }
   state.screenCornersManual = Boolean(saved.screenCornersManual);
+  if (state.screenCornersManual) {
+    state.screenManualPhase = "adjusting";
+    state.screenCornerSource = "manual";
+    state.screenDetectionMessage = "已載入上次的手動四角位置。請確認或移動後，再按「四角移動完成，開始驗證」。";
+  } else {
+    state.screenManualPhase = "off";
+    state.screenCornerSource = "none";
+  }
   state.importedVideoName = typeof saved.importedVideoName === "string" ? saved.importedVideoName : "";
   state.livePolicy = saved.livePolicy && Array.isArray(saved.livePolicy.modes)
     ? JSON.parse(JSON.stringify(saved.livePolicy))

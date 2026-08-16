@@ -1581,9 +1581,10 @@ class RuntimeServices:
     ) -> dict[str, Any]:
         required_frames = 3
         corners = screen.get("screenCorners")
+        manual_corners = screen.get("cornerSource") == "manual"
         qualified = (
             bool(screen.get("screenDetected"))
-            and float(screen.get("screenConfidence") or 0) >= confidence_threshold
+            and (manual_corners or float(screen.get("screenConfidence") or 0) >= confidence_threshold)
             and isinstance(corners, list)
             and len(corners) == 4
         )

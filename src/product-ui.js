@@ -1321,7 +1321,9 @@
   }
 
   async function captureVisionFrame() {
+    if (runtime.state.screenCornersManual && runtime.state.screenManualPhase === "adjusting") return;
     if (ui.visionBusy || !ui.visionVideo?.videoWidth || !ui.current?.manifest?.id) return;
+    const cameraVerificationId = runtime.state.cameraVerificationId;
     ui.visionBusy = true;
     try {
       const settings = runtime.state.runtimeSettings.vision || {};
@@ -1352,6 +1354,7 @@
           screenCornerSource: runtime.state.screenCornersManual ? "manual" : "locked_auto"
         }
       });
+      if (cameraVerificationId !== runtime.state.cameraVerificationId) return;
       runtime.setLatestGameState(result.state);
       runtime.setEngineRuntimeStatus(result.engine || {});
       if (ui.menuTeaching && menuDemonstration && !isNeutralMenuAction(menuDemonstration.action)) {
@@ -1363,7 +1366,9 @@
         await dispatchEngineAction(result.action);
       }
     } catch (error) {
-      runtime.setLatestGameState({ message: `畫格處理暫停：${error.message}`, confidence: 0 });
+      if (cameraVerificationId === runtime.state.cameraVerificationId) {
+        runtime.setLatestGameState({ message: `畫格處理暫停：${error.message}`, confidence: 0 });
+      }
     } finally {
       ui.visionBusy = false;
     }

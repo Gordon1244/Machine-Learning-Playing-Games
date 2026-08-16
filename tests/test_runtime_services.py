@@ -271,6 +271,32 @@ class RuntimeServicesTest(unittest.TestCase):
         self.assertEqual(changed["state"]["verificationFrames"], 1)
         self.assertIsNone(changed["action"])
 
+    def test_manual_screen_corners_use_visual_evidence_without_auto_confidence_gate(self):
+        corners = [
+            {"x": 0.08, "y": 0.1}, {"x": 0.92, "y": 0.1},
+            {"x": 0.92, "y": 0.9}, {"x": 0.08, "y": 0.9},
+        ]
+        manual = {
+            "screenDetected": True,
+            "screenConfidence": 0.6,
+            "screenCorners": corners,
+            "cornerSource": "manual",
+        }
+        automatic = {**manual, "cornerSource": "locked_auto"}
+
+        for _ in range(3):
+            manual_result = self.services.verify_screen_stability(
+                self.project_id, dict(manual), 0.75, "manual-session"
+            )
+        auto_result = self.services.verify_screen_stability(
+            self.project_id, dict(automatic), 0.75, "auto-session"
+        )
+
+        self.assertTrue(manual_result["screenDetected"])
+        self.assertEqual(manual_result["verificationFrames"], 3)
+        self.assertFalse(auto_result["screenDetected"])
+        self.assertEqual(auto_result["verificationFrames"], 0)
+
     def test_frame_rejects_missing_camera_verification_session(self):
         self.use_fake_worker()
         with self.assertRaises(services_module.ServiceError) as raised:
